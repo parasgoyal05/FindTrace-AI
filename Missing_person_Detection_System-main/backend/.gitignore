@@ -1,0 +1,54 @@
+
+# Python
+__pycache__/
+*.py[cod]
+venv/
+.venv/
+.env
+
+# Logs
+*.log
+
+# Private biometric data
+stored_embeddings.json
+
+# Uploaded images and generated files
+**/uploads/*
+!**/uploads/.gitkeep
+
+# IDE
+.vscode/
+
+# Cache
+.pytest_cache/
+
+
+# Python environments
+.venv/
+.venv-1/
+venv/
+
+# Logs
+*.log
+
+# Private data
+stored_embeddings.json
+
+# Uploaded/generated images
+uploads/
+snapshots/
+evidence/
+
+
+# LFW datasets
+lfw_experiment/gallery/
+lfw_experiment/probe/
+lfw_experiment/name_mapping.json
+
+lfw_experiment_original/gallery/
+lfw_experiment_original/probe/
+lfw_experiment_original/name_mapping.json
+
+# Camera configuration
+../streams/cameras.json
+../streams/

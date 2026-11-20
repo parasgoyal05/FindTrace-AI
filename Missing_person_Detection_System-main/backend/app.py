@@ -89,7 +89,7 @@ class AlertSystem:
                           cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
             
             # Save snapshot
-            # cv2.imwrite(filepath, annotated_frame)
+            cv2.imwrite(filepath, annotated_frame)
             return filepath
         except Exception as e:
             logging.error(f"Error saving snapshot: {e}")
@@ -710,85 +710,250 @@ def find_matching_person(detected_embedding, threshold=0.6):
 @app.route('/detect', methods=['POST'])
 def detect_person():
     """
-    POST endpoint to detect a person from camera/image
-    Accepts form data: 'image' (file upload or base64)
-    Returns JSON with matched persons if found
+    Process an uploaded image using the separate image detection pipeline.
+    Live video detection remains unchanged.
     """
-    # Check if image file is provided
+
     if 'image' not in request.files:
         return jsonify({
             'success': False,
             'error': 'Missing required field: image'
         }), 400
-    
+
     image_file = request.files['image']
-    
-    # Validate file
+
     if image_file.filename == '':
         return jsonify({
             'success': False,
             'error': 'No file selected'
         }), 400
-    
-    # Save uploaded file temporarily
-    filename = secure_filename(image_file.filename) if image_file.filename else 'camera_capture.jpg'
-    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-    unique_filename = f"detect_{timestamp}_{filename}"
-    filepath = os.path.join(app.config['UPLOAD_FOLDER'], unique_filename)
-    
+
     try:
-        image_file.save(filepath)
-        
-        # Compute face embedding
-        embedding = compute_face_embedding(filepath)
-        
-        if embedding is None:
-            # Clean up uploaded file
-            if os.path.exists(filepath):
-                os.remove(filepath)
+        image = read_uploaded_image(image_file)
+
+        if image is None:
             return jsonify({
                 'success': False,
-                'error': 'No face detected in the image.'
+                'error': 'Could not read uploaded image'
             }), 400
-        
-        # Find matching persons
-        matches = find_matching_person(embedding, threshold=0.6)
-        
-        # Clean up uploaded file
-        if os.path.exists(filepath):
-            os.remove(filepath)
-        
-        if matches:
-            return jsonify({
-                'success': True,
-                'matches': matches,
-                'message': f'Found {len(matches)} potential match(es)'
-            }), 200
-        else:
-            return jsonify({
-                'success': True,
-                'matches': [],
-                'message': 'No matching person found in database'
-            }), 200
-            
+
+        result = realtime_detector.process_image(image)
+
+        matches = result['matches']
+
+        return jsonify({
+            'success': True,
+            'faces_detected': result['faces_detected'],
+            'matches': matches,
+            'bounding_boxes': result['bounding_boxes'],
+            'message': (
+                f"Found {len(matches)} potential match(es)"
+                if matches
+                else f"Detected {result['faces_detected']} face(s), "
+                     "but no potential matches were found"
+            )
+        }), 200
+
     except Exception as e:
-        # Clean up uploaded file on error
-        if os.path.exists(filepath):
-            try:
-                os.remove(filepath)
-            except:
-                pass
-        error_msg = str(e)
-        try:
-            error_msg = error_msg.encode('ascii', 'replace').decode('ascii')
-        except:
-            error_msg = "An error occurred while processing the detection"
+        logging.exception("Uploaded image detection error")
+
         return jsonify({
             'success': False,
-            'error': f'Server error: {error_msg}'
+            'error': f'Image processing failed: {str(e)}'
+        }), 500
+
+# ================= GROUP PHOTO FACE SELECTION =================
+
+def read_uploaded_image(file):
+    """
+    Convert uploaded image into OpenCV format.
+    """
+    image_bytes = file.read()
+
+    if not image_bytes:
+        return None
+
+    image_array = np.frombuffer(image_bytes, np.uint8)
+
+    image = cv2.imdecode(
+        image_array,
+        cv2.IMREAD_COLOR
+    )
+
+    return image
+
+
+def detect_all_faces(image):
+    """
+    Detect all faces using the existing ArcFace model.
+
+    Faces are sorted from left to right so that
+    Face 1, Face 2, Face 3 numbering stays consistent.
+    """
+
+    faces = arcface_model.get(image)
+
+    faces = sorted(
+        faces,
+        key=lambda face: float(
+            (face.bbox[0] + face.bbox[2]) / 2
+        )
+    )
+
+    return faces
+
+
+@app.route('/detect_faces', methods=['POST'])
+def detect_faces_for_selection():
+
+    if 'image' not in request.files:
+        return jsonify({
+            'success': False,
+            'error': 'Image file is missing'
+        }), 400
+
+    try:
+        image = read_uploaded_image(request.files['image'])
+
+        if image is None:
+            return jsonify({
+                'success': False,
+                'error': 'Could not read uploaded image'
+            }), 400
+
+        # Detect every face
+        faces = detect_all_faces(image)
+
+        face_results = []
+
+        for index, face in enumerate(faces):
+
+            x1, y1, x2, y2 = [
+                int(round(value))
+                for value in face.bbox
+            ]
+
+            face_results.append({
+                'face_index': index,
+                'label': f'Face {index + 1}',
+
+                'bbox': {
+                    'x1': max(0, x1),
+                    'y1': max(0, y1),
+                    'x2': min(image.shape[1], x2),
+                    'y2': min(image.shape[0], y2)
+                }
+            })
+
+        return jsonify({
+            'success': True,
+            'faces_detected': len(face_results),
+            'faces': face_results,
+            'message': f'Detected {len(face_results)} faces'
+        }), 200
+
+    except Exception as e:
+
+        logging.exception("Face detection error")
+
+        return jsonify({
+            'success': False,
+            'error': str(e)
         }), 500
 
 
+@app.route('/match_selected_face', methods=['POST'])
+def match_selected_face():
+
+    if 'image' not in request.files:
+        return jsonify({
+            'success': False,
+            'error': 'Image file is missing'
+        }), 400
+
+    try:
+        face_index = int(request.form.get('face_index'))
+
+        if face_index < 0:
+            raise ValueError("Invalid face index")
+
+    except (TypeError, ValueError):
+
+        return jsonify({
+            'success': False,
+            'error': 'Valid face index is required'
+        }), 400
+
+    try:
+
+        image = read_uploaded_image(request.files['image'])
+
+        if image is None:
+            return jsonify({
+                'success': False,
+                'error': 'Could not read uploaded image'
+            }), 400
+
+        # Detect faces again in the same left-to-right order
+        faces = detect_all_faces(image)
+
+        if face_index >= len(faces):
+
+            return jsonify({
+                'success': False,
+                'error': 'Selected face not found'
+            }), 400
+
+        # Get only the selected face
+        selected_face = faces[face_index]
+
+        # Generate ArcFace embedding
+        embedding = np.asarray(
+            selected_face.embedding,
+            dtype=np.float32
+        )
+
+        # Normalize embedding
+        norm = np.linalg.norm(embedding)
+
+        if norm == 0:
+            return jsonify({
+                'success': False,
+                'error': 'Invalid face embedding'
+            }), 400
+
+        embedding = (embedding / norm).tolist()
+
+        # Existing cosine similarity matching logic
+        matches = realtime_detector.match_person(
+            np.asarray(embedding, dtype=np.float32)
+        )
+
+        best_match = matches[0] if matches else None
+
+        return jsonify({
+            'success': True,
+            'face_index': face_index,
+            'face_label': f'Face {face_index + 1}',
+            'matches': matches,
+            'best_match': best_match,
+
+            'message': (
+                f"Potential match: {best_match['name']} "
+                f"({best_match['confidence']})"
+                if best_match
+                else 'No potential match found'
+            )
+        }), 200
+
+    except Exception as e:
+
+        logging.exception("Selected face matching error")
+
+        return jsonify({
+            'success': False,
+            'error': str(e)
+        }), 500
 @app.route('/health', methods=['GET'])
 def health_check():
     """Health check endpoint"""

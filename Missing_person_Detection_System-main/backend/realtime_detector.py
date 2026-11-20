@@ -396,6 +396,100 @@ class RealTimeDetector:
             'matches': all_matches,
             'bounding_boxes': bounding_boxes
         }
+        # ---------------- PROCESS UPLOADED IMAGE ----------------
+
+    def process_image(self, image):
+        """
+        Process an uploaded image using YOLO and ArcFace.
+        This method is separate from the live video pipeline.
+        """
+
+        yolo_faces = self.detect_faces(image)
+        arcface_dets = self.arcface.get(image)
+        print(f"[IMAGE DEBUG] YOLO faces: {len(yolo_faces)}, ArcFace faces: {len(arcface_dets)}")
+        faces = []
+
+        # Add YOLO detections
+        for f in yolo_faces:
+            faces.append({
+                'face': f['face'],
+                'bbox': f['bbox'],
+                'source': 'yolo',
+                'embedding': None
+            })
+
+        # Add ArcFace detections
+        for af in arcface_dets:
+            if not hasattr(af, 'bbox') or af.bbox is None:
+                continue
+
+            x1, y1, x2, y2 = map(int, af.bbox)
+
+            if x1 < 0 or y1 < 0 or x2 <= x1 or y2 <= y1:
+                continue
+
+            face_img = image[y1:y2, x1:x2]
+
+            if face_img.size == 0:
+                continue
+
+            embedding = None
+
+            if hasattr(af, 'embedding') and af.embedding is not None:
+                embedding = np.array(af.embedding)
+                norm = np.linalg.norm(embedding)
+
+                if norm > 0:
+                    embedding = embedding / norm
+                else:
+                    embedding = None
+
+            faces.append({
+                'face': face_img,
+                'bbox': [x1, y1, x2 - x1, y2 - y1],
+                'source': 'arcface',
+                'embedding': embedding
+            })
+
+        bounding_boxes = []
+        all_matches = []
+
+        for face_data in faces:
+            embedding = face_data['embedding']
+
+            if embedding is None:
+                embedding = self.get_embedding(face_data['face'])
+
+            matches = (
+                self.match_person(embedding)
+                if embedding is not None
+                else []
+            )
+
+            bbox = face_data['bbox']
+
+            for match in matches:
+                match['bbox'] = bbox
+                all_matches.append(match)
+
+            bounding_boxes.append({
+                'bbox': bbox,
+                'has_match': len(matches) > 0,
+                'matches': matches
+            })
+
+        bounding_boxes = self._dedupe_boxes(bounding_boxes)
+
+        # Keep only matches belonging to the final, deduplicated boxes
+        all_matches = []
+        for box in bounding_boxes:
+            all_matches.extend(box['matches'])
+
+        return {
+            'faces_detected': len(bounding_boxes),
+            'matches': all_matches,
+            'bounding_boxes': bounding_boxes
+        }
 
     def get_recent_matches(self, limit=10):
         """Return recent matches (most recent first)"""

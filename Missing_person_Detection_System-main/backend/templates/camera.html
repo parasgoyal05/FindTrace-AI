@@ -4,6 +4,7 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Camera Detection - Missing Person Detection</title>
+
     <style>
         * {
             margin: 0;
@@ -98,10 +99,11 @@
             overflow: hidden;
         }
 
-        #videoElement {
+        #imageCanvas {
             width: 100%;
             height: auto;
             display: block;
+            cursor: crosshair;
         }
 
         .controls {
@@ -278,23 +280,6 @@
             100% { transform: rotate(360deg); }
         }
 
-        .status-indicator {
-            display: inline-block;
-            width: 12px;
-            height: 12px;
-            border-radius: 50%;
-            margin-right: 8px;
-        }
-
-        .status-indicator.active {
-            background-color: #28a745;
-            box-shadow: 0 0 10px #28a745;
-        }
-
-        .status-indicator.inactive {
-            background-color: #dc3545;
-        }
-
         .alert-banner {
             position: fixed;
             top: 20px;
@@ -329,8 +314,10 @@
         }
     </style>
 </head>
+
 <body>
     <div class="container">
+
         <div class="header">
             <h1>📹 Camera Detection</h1>
             <p>Real-time face detection and matching</p>
@@ -345,398 +332,965 @@
         </div>
 
         <div class="content">
-            <!-- Camera Section -->
+
+            <!-- Group Photo Upload Section -->
             <div class="section">
-                <h2>
-                    <span class="status-indicator" id="statusIndicator"></span>
-                    Camera Feed
-                </h2>
-                <div class="video-container">
-                    <video id="videoElement" autoplay playsinline></video>
-                </div>
+
+                <h2>Upload Group Photo</h2>
+
                 <div class="controls">
-                    <button class="btn btn-success" id="startBtn">Start Camera</button>
-                    <button class="btn" id="captureBtn" disabled>Capture & Detect</button>
-                    <button class="btn btn-danger" id="stopBtn" disabled>Stop Camera</button>
+                    <input
+                        type="file"
+                        id="imageInput"
+                        accept="image/*"
+                        class="btn"
+                    >
+
+                    <button
+                        class="btn btn-success"
+                        id="detectFacesBtn"
+                        disabled
+                    >
+                        Detect Faces
+                    </button>
                 </div>
+
+                <div class="video-container" style="margin-top: 20px;">
+                    <canvas
+                        id="imageCanvas"
+                        style="display: none; width: 100%; height: auto; cursor: crosshair;"
+                    ></canvas>
+                </div>
+
                 <div id="cameraMessage" class="message"></div>
+
                 <div id="cameraLoading" class="loading">
                     <div class="spinner"></div>
                     <p>Processing image...</p>
                 </div>
+
+                <div id="faceSelectionList" style="margin-top: 20px;"></div>
+
+                <div class="controls">
+                    <button
+                        class="btn btn-success"
+                        id="matchSelectedFaceBtn"
+                        disabled
+                    >
+                        Search Selected Face
+                    </button>
+                </div>
+
             </div>
 
             <!-- Results Section -->
             <div class="section">
+
                 <h2>Detection Results</h2>
+
                 <div id="resultsContainer" class="matches-container">
                     <div class="empty-state">
-                        Capture an image to detect missing persons
+                        Upload a group photo and select a face to search.
                     </div>
                 </div>
+
             </div>
+
         </div>
     </div>
 
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/socket.io/4.7.2/socket.io.js"></script>
+
     <script>
-        const API_BASE_URL = 'http://localhost:5000';
-        let stream = null;
-        let video = document.getElementById('videoElement');
-        let canvas = document.createElement('canvas');
-        let context = canvas.getContext('2d');
+        const API_BASE_URL = window.location.origin;
 
-        // Initialize video element
-        video.onloadedmetadata = function() {
-            console.log('Video metadata loaded, dimensions:', video.videoWidth, 'x', video.videoHeight);
-        };
+        // ==========================================
+        // GROUP PHOTO UPLOAD ELEMENTS
+        // ==========================================
 
-        video.oncanplay = function() {
-            console.log('Video can play');
-        };
+        const imageInput = document.getElementById('imageInput');
+        const imageCanvas = document.getElementById('imageCanvas');
+        const imageContext = imageCanvas.getContext('2d');
 
-        video.onerror = function(e) {
-            console.error('Video element error:', e);
-        };
+        const detectFacesBtn = document.getElementById('detectFacesBtn');
+        const matchSelectedFaceBtn = document.getElementById('matchSelectedFaceBtn');
 
-        const startBtn = document.getElementById('startBtn');
-        const captureBtn = document.getElementById('captureBtn');
-        const stopBtn = document.getElementById('stopBtn');
-        const statusIndicator = document.getElementById('statusIndicator');
+        const faceSelectionList = document.getElementById('faceSelectionList');
+        const resultsContainer = document.getElementById('resultsContainer');
+        const cameraLoading = document.getElementById('cameraLoading');
 
-        // Initialize SocketIO connection
+        let uploadedImage = null;
+        let previewImage = null;
+
+        let detectedFaces = [];
+        let selectedFaceIndex = null;
+
+
+        // ==========================================
+        // EXISTING SOCKET.IO CONNECTION
+        // PRESERVED FOR ALERT FUNCTIONALITY
+        // ==========================================
+
         const socket = io(API_BASE_URL);
 
-        // SocketIO event listeners
-        socket.on('connect', function() {
+        socket.on('connect', function () {
             console.log('Connected to server');
         });
 
-        socket.on('disconnect', function() {
+        socket.on('disconnect', function () {
             console.log('Disconnected from server');
         });
 
-        socket.on('alert_triggered', function(data) {
+        socket.on('alert_triggered', function (data) {
             console.log('Alert triggered:', data);
-            
-            // Show alert banner with sound
+
             showAlert(data);
-            
-            // Play alert sound if supported
             playAlertSound();
         });
 
-        // Start camera
-        startBtn.addEventListener('click', async function() {
-            try {
-                console.log('Requesting camera access...');
-                
-                // Check if media devices are supported
-                if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
-                    throw new Error('Camera API not supported in this browser');
-                }
-                
-                // Check current permission status if available
-                if (navigator.permissions) {
-                    const permissionStatus = await navigator.permissions.query({ name: 'camera' });
-                    console.log('Camera permission status:', permissionStatus.state);
-                }
-                
-                stream = await navigator.mediaDevices.getUserMedia({ 
-                    video: { 
-                        facingMode: 'user',
-                        width: { ideal: 1280 },
-                        height: { ideal: 720 }
-                    } 
-                });
-                
-                console.log('Camera access granted, stream tracks:', stream.getVideoTracks().length);
-                
-                // Fallback: try basic video access if the first attempt fails
-                if (stream.getVideoTracks().length === 0) {
-                    console.log('No video tracks, trying fallback...');
-                    stream.getTracks().forEach(track => track.stop());
-                    
-                    stream = await navigator.mediaDevices.getUserMedia({ 
-                        video: true 
-                    });
-                    console.log('Fallback camera access granted');
-                }
-                video.srcObject = stream;
-                
-                startBtn.disabled = true;
-                captureBtn.disabled = false;
-                stopBtn.disabled = false;
-                statusIndicator.classList.add('active');
-                statusIndicator.classList.remove('inactive');
-                showMessage('cameraMessage', 'Camera started successfully', 'success');
-            } catch (error) {
-                console.error('Camera access error:', error);
-                let errorMessage = error.message;
-                
-                // Provide more helpful error messages
-                if (error.name === 'NotAllowedError') {
-                    errorMessage = 'Camera access denied. Please allow camera access and try again.';
-                } else if (error.name === 'NotFoundError') {
-                    errorMessage = 'No camera found. Please connect a camera and try again.';
-                } else if (error.name === 'NotReadableError') {
-                    errorMessage = 'Camera is already in use by another application.';
-                } else if (error.name === 'OverconstrainedError') {
-                    errorMessage = 'Camera does not support the requested resolution.';
-                }
-                
-                showMessage('cameraMessage', `Error accessing camera: ${errorMessage}`, 'error');
-            }
-        });
 
-        // Stop camera
-        stopBtn.addEventListener('click', function() {
-            if (stream) {
-                stream.getTracks().forEach(track => track.stop());
-                stream = null;
-                video.srcObject = null;
-                startBtn.disabled = false;
-                captureBtn.disabled = true;
-                stopBtn.disabled = true;
-                statusIndicator.classList.remove('active');
-                statusIndicator.classList.add('inactive');
-                showMessage('cameraMessage', 'Camera stopped', 'info');
-            }
-        });
+        // ==========================================
+        // IMAGE UPLOAD AND PREVIEW
+        // ==========================================
 
-        // Capture and detect
-        captureBtn.addEventListener('click', async function() {
-            if (!stream) {
-                showMessage('cameraMessage', 'Please start the camera first', 'error');
+        imageInput.addEventListener('change', function () {
+
+            const file = imageInput.files && imageInput.files[0];
+
+            uploadedImage = null;
+            previewImage = null;
+
+            detectedFaces = [];
+            selectedFaceIndex = null;
+
+            detectFacesBtn.disabled = true;
+            matchSelectedFaceBtn.disabled = true;
+
+            faceSelectionList.innerHTML = '';
+
+            resultsContainer.innerHTML =
+                '<div class="empty-state">Select a face and search to see matching results.</div>';
+
+            if (!file) {
+                imageCanvas.style.display = 'none';
                 return;
             }
 
-            const loading = document.getElementById('cameraLoading');
-            const message = document.getElementById('cameraMessage');
-            
-            captureBtn.disabled = true;
-            loading.classList.add('show');
-            message.classList.remove('show');
+            if (!file.type.startsWith('image/')) {
+
+                imageInput.value = '';
+                imageCanvas.style.display = 'none';
+
+                showMessage(
+                    'cameraMessage',
+                    'Please select a valid image file.',
+                    'error'
+                );
+
+                return;
+            }
+
+            uploadedImage = file;
+
+            const imageUrl = URL.createObjectURL(file);
+            const image = new Image();
+
+            image.onload = function () {
+
+                previewImage = image;
+
+                imageCanvas.width = image.naturalWidth;
+                imageCanvas.height = image.naturalHeight;
+
+                imageCanvas.style.display = 'block';
+
+                drawImageWithBoxes();
+
+                detectFacesBtn.disabled = false;
+
+                URL.revokeObjectURL(imageUrl);
+
+                showMessage(
+                    'cameraMessage',
+                    'Photo uploaded successfully. Click Detect Faces.',
+                    'success'
+                );
+            };
+
+            image.onerror = function () {
+
+                URL.revokeObjectURL(imageUrl);
+
+                uploadedImage = null;
+                imageInput.value = '';
+
+                imageCanvas.style.display = 'none';
+
+                showMessage(
+                    'cameraMessage',
+                    'Could not load this image. Please try another file.',
+                    'error'
+                );
+            };
+
+            image.src = imageUrl;
+        });
+
+
+        // ==========================================
+        // DETECT ALL FACES IN GROUP PHOTO
+        // ==========================================
+
+        detectFacesBtn.addEventListener('click', async function () {
+
+            if (!uploadedImage) {
+
+                showMessage(
+                    'cameraMessage',
+                    'Please upload a group photo first.',
+                    'error'
+                );
+
+                return;
+            }
+
+            detectFacesBtn.disabled = true;
+            matchSelectedFaceBtn.disabled = true;
+
+            cameraLoading.classList.add('show');
+
+            detectedFaces = [];
+            selectedFaceIndex = null;
+
+            faceSelectionList.innerHTML = '';
+
+            resultsContainer.innerHTML =
+                '<div class="empty-state">Select a detected face to search the stored persons.</div>';
 
             try {
-                // Set canvas dimensions to match video
-                canvas.width = video.videoWidth;
-                canvas.height = video.videoHeight;
-                
-                // Draw video frame to canvas
-                context.drawImage(video, 0, 0, canvas.width, canvas.height);
-                
-                // Convert canvas to blob
-                canvas.toBlob(async function(blob) {
-                    const formData = new FormData();
-                    formData.append('image', blob, 'camera_capture.jpg');
 
-                    try {
-                        const response = await fetch(`${API_BASE_URL}/detect`, {
-                            method: 'POST',
-                            body: formData
-                        });
+                const formData = new FormData();
 
-                        const data = await response.json();
-                        loading.classList.remove('show');
+                formData.append(
+                    'image',
+                    uploadedImage,
+                    uploadedImage.name
+                );
 
-                        if (data.success) {
-                            if (data.matches && data.matches.length > 0) {
-                                displayMatches(data.matches, data.faces_detected || 1);
-                                showMessage('cameraMessage', data.message, 'success');
-                            } else {
-                                displayMatches([], data.faces_detected || 0);
-                                showMessage('cameraMessage', data.message, 'info');
-                            }
-                        } else {
-                            showMessage('cameraMessage', `Error: ${data.error}`, 'error');
-                            displayMatches([], 0);
-                        }
-                    } catch (error) {
-                        loading.classList.remove('show');
-                        showMessage('cameraMessage', `Error: ${error.message}`, 'error');
-                        displayMatches([]);
-                    } finally {
-                        captureBtn.disabled = false;
+                const response = await fetch(
+                    `${API_BASE_URL}/detect_faces`,
+                    {
+                        method: 'POST',
+                        body: formData
                     }
-                }, 'image/jpeg', 0.95);
+                );
+
+                const data = await response.json();
+
+                if (!response.ok || !data.success) {
+                    throw new Error(data.error || 'Face detection failed.');
+                }
+
+                detectedFaces = data.faces || [];
+
+                drawImageWithBoxes();
+
+                renderFaceSelectionButtons();
+
+                if (detectedFaces.length === 0) {
+
+                    showMessage(
+                        'cameraMessage',
+                        'No faces were detected in this image.',
+                        'info'
+                    );
+
+                    resultsContainer.innerHTML =
+                        '<div class="empty-state">No faces detected in the uploaded image.</div>';
+
+                } else {
+
+                    showMessage(
+                        'cameraMessage',
+                        `Detected ${detectedFaces.length} face(s). Click a box or Face button to select one.`,
+                        'success'
+                    );
+                }
+
             } catch (error) {
-                loading.classList.remove('show');
-                showMessage('cameraMessage', `Error capturing image: ${error.message}`, 'error');
-                captureBtn.disabled = false;
+
+                console.error('Face detection error:', error);
+
+                showMessage(
+                    'cameraMessage',
+                    `Error: ${error.message}`,
+                    'error'
+                );
+
+            } finally {
+
+                cameraLoading.classList.remove('show');
+                detectFacesBtn.disabled = false;
             }
         });
 
-        // Display matches
-        function displayMatches(matches, facesDetected = 0) {
-            const container = document.getElementById('resultsContainer');
-            
-            if (matches.length === 0) {
-                if (facesDetected > 0) {
-                    container.innerHTML = `<div class="empty-state">Detected ${facesDetected} face(s) but no matches found in database</div>`;
-                } else {
-                    container.innerHTML = '<div class="empty-state">No faces detected in the image</div>';
-                }
+
+        // ==========================================
+        // DRAW IMAGE AND FACE BOUNDING BOXES
+        // ==========================================
+
+        function drawImageWithBoxes() {
+
+            if (!previewImage) return;
+
+            imageContext.clearRect(
+                0,
+                0,
+                imageCanvas.width,
+                imageCanvas.height
+            );
+
+            imageContext.drawImage(
+                previewImage,
+                0,
+                0,
+                imageCanvas.width,
+                imageCanvas.height
+            );
+
+            detectedFaces.forEach(function (face) {
+
+                const box = face.bbox;
+
+                const selected =
+                    face.face_index === selectedFaceIndex;
+
+                const label =
+                    face.label || `Face ${face.face_index + 1}`;
+
+                const fontSize = Math.max(
+                    18,
+                    imageCanvas.width / 45
+                );
+
+                imageContext.lineWidth = Math.max(
+                    3,
+                    imageCanvas.width / 500
+                );
+
+                imageContext.strokeStyle = selected
+                    ? '#ffcc00'
+                    : '#00e676';
+
+                imageContext.strokeRect(
+                    box.x1,
+                    box.y1,
+                    box.x2 - box.x1,
+                    box.y2 - box.y1
+                );
+
+                imageContext.font = `bold ${fontSize}px Arial`;
+
+                const labelWidth =
+                    imageContext.measureText(label).width + 16;
+
+                const labelHeight = fontSize + 12;
+
+                const labelY = Math.max(
+                    0,
+                    box.y1 - labelHeight
+                );
+
+                imageContext.fillStyle = selected
+                    ? '#ffcc00'
+                    : '#00e676';
+
+                imageContext.fillRect(
+                    box.x1,
+                    labelY,
+                    labelWidth,
+                    labelHeight
+                );
+
+                imageContext.fillStyle = '#111';
+
+                imageContext.fillText(
+                    label,
+                    box.x1 + 8,
+                    labelY + fontSize
+                );
+            });
+        }
+
+
+        // ==========================================
+        // CREATE FACE SELECTION BUTTONS
+        // ==========================================
+
+        function renderFaceSelectionButtons() {
+
+            faceSelectionList.innerHTML = '';
+
+            if (detectedFaces.length === 0) return;
+
+            const heading = document.createElement('h3');
+
+            heading.textContent = 'Select a face to search';
+            heading.style.marginBottom = '12px';
+
+            faceSelectionList.appendChild(heading);
+
+            const buttonContainer = document.createElement('div');
+
+            buttonContainer.style.display = 'flex';
+            buttonContainer.style.flexWrap = 'wrap';
+            buttonContainer.style.gap = '10px';
+
+            detectedFaces.forEach(function (face) {
+
+                const button = document.createElement('button');
+
+                button.type = 'button';
+                button.className = 'btn';
+
+                button.textContent =
+                    face.label || `Face ${face.face_index + 1}`;
+
+                button.dataset.faceIndex = face.face_index;
+
+                button.addEventListener('click', function () {
+                    selectFace(face.face_index);
+                });
+
+                buttonContainer.appendChild(button);
+            });
+
+            faceSelectionList.appendChild(buttonContainer);
+        }
+
+
+        // ==========================================
+        // SELECT A FACE
+        // ==========================================
+
+        function selectFace(faceIndex) {
+
+            const faceExists = detectedFaces.some(
+                face => face.face_index === faceIndex
+            );
+
+            if (!faceExists) return;
+
+            selectedFaceIndex = faceIndex;
+
+            matchSelectedFaceBtn.disabled = false;
+
+            drawImageWithBoxes();
+
+            faceSelectionList
+                .querySelectorAll('button[data-face-index]')
+                .forEach(function (button) {
+
+                    const isSelected =
+                        Number(button.dataset.faceIndex) === faceIndex;
+
+                    button.style.outline = isSelected
+                        ? '3px solid #28a745'
+                        : 'none';
+                });
+
+            showMessage(
+                'cameraMessage',
+                `Face ${faceIndex + 1} selected. Click Search Selected Face.`,
+                'info'
+            );
+        }
+
+
+        // ==========================================
+        // SELECT FACE BY CLICKING ITS BOUNDING BOX
+        // ==========================================
+
+        imageCanvas.addEventListener('click', function (event) {
+
+            if (!previewImage || detectedFaces.length === 0) {
                 return;
             }
 
-            // Group matches by person name
+            const rect = imageCanvas.getBoundingClientRect();
+
+            const scaleX =
+                imageCanvas.width / rect.width;
+
+            const scaleY =
+                imageCanvas.height / rect.height;
+
+            const clickX =
+                (event.clientX - rect.left) * scaleX;
+
+            const clickY =
+                (event.clientY - rect.top) * scaleY;
+
+            const containingFaces = detectedFaces.filter(
+                function (face) {
+
+                    const box = face.bbox;
+
+                    return (
+                        clickX >= box.x1 &&
+                        clickX <= box.x2 &&
+                        clickY >= box.y1 &&
+                        clickY <= box.y2
+                    );
+                }
+            );
+
+            if (containingFaces.length > 0) {
+
+                // If boxes overlap, select the smallest containing box.
+                containingFaces.sort(function (a, b) {
+
+                    const areaA =
+                        (a.bbox.x2 - a.bbox.x1) *
+                        (a.bbox.y2 - a.bbox.y1);
+
+                    const areaB =
+                        (b.bbox.x2 - b.bbox.x1) *
+                        (b.bbox.y2 - b.bbox.y1);
+
+                    return areaA - areaB;
+                });
+
+                selectFace(containingFaces[0].face_index);
+            }
+        });
+
+
+        // ==========================================
+        // MATCH ONLY THE SELECTED FACE
+        // ==========================================
+
+        matchSelectedFaceBtn.addEventListener('click', async function () {
+
+            if (!uploadedImage || selectedFaceIndex === null) {
+
+                showMessage(
+                    'cameraMessage',
+                    'Please select a detected face first.',
+                    'error'
+                );
+
+                return;
+            }
+
+            matchSelectedFaceBtn.disabled = true;
+
+            cameraLoading.classList.add('show');
+
+            try {
+
+                const formData = new FormData();
+
+                formData.append(
+                    'image',
+                    uploadedImage,
+                    uploadedImage.name
+                );
+
+                formData.append(
+                    'face_index',
+                    String(selectedFaceIndex)
+                );
+
+                const response = await fetch(
+                    `${API_BASE_URL}/match_selected_face`,
+                    {
+                        method: 'POST',
+                        body: formData
+                    }
+                );
+
+                const data = await response.json();
+
+                if (!response.ok || !data.success) {
+                    throw new Error(
+                        data.error || 'Selected face matching failed.'
+                    );
+                }
+
+                displayMatches(
+                    data.matches || [],
+                    1
+                );
+
+                showMessage(
+                    'cameraMessage',
+                    data.message || 'Matching completed.',
+                    data.best_match ? 'success' : 'info'
+                );
+
+            } catch (error) {
+
+                console.error(
+                    'Selected face matching error:',
+                    error
+                );
+
+                resultsContainer.innerHTML =
+                    `<div class="empty-state">${escapeHtml(error.message)}</div>`;
+
+                showMessage(
+                    'cameraMessage',
+                    `Error: ${error.message}`,
+                    'error'
+                );
+
+            } finally {
+
+                cameraLoading.classList.remove('show');
+
+                matchSelectedFaceBtn.disabled =
+                    selectedFaceIndex === null;
+            }
+        });
+
+
+        // ==========================================
+        // DISPLAY MATCHES
+        // EXISTING RESULTS FUNCTION PRESERVED
+        // ==========================================
+
+        function displayMatches(matches, facesDetected = 0) {
+
+            const container =
+                document.getElementById('resultsContainer');
+
+            if (matches.length === 0) {
+
+                if (facesDetected > 0) {
+
+                    container.innerHTML =
+                        `<div class="empty-state">
+                            Detected ${facesDetected} face(s) but no matches found in database
+                        </div>`;
+
+                } else {
+
+                    container.innerHTML =
+                        '<div class="empty-state">No faces detected in the image</div>';
+                }
+
+                return;
+            }
+
+            // Group matches by person name.
             const matchesByPerson = {};
+
             matches.forEach(match => {
+
                 if (!matchesByPerson[match.name]) {
                     matchesByPerson[match.name] = [];
                 }
+
                 matchesByPerson[match.name].push(match);
             });
 
             const uniquePersons = Object.keys(matchesByPerson);
+
             const personCount = uniquePersons.length;
 
-            let html = `<div class="detection-summary">Detected ${facesDetected} face(s), found ${personCount} missing person${personCount > 1 ? 's' : ''}!</div>`;
-            
+            let html =
+                `<div class="detection-summary">
+                    Detected ${facesDetected} face(s), found ${personCount}
+                    missing person${personCount > 1 ? 's' : ''}!
+                </div>`;
+
             if (personCount > 1) {
-                // Multiple persons found - show consolidated view
-                html += `<div class="multiple-persons-alert">
-                    <h3>🚨 MULTIPLE MISSING PERSONS FOUND 🚨</h3>
-                    <p><strong>${personCount} missing persons detected:</strong></p>
-                    <ul>`;
-                
+
+                html +=
+                    `<div class="multiple-persons-alert">
+                        <h3>🚨 MULTIPLE MISSING PERSONS FOUND 🚨</h3>
+                        <p><strong>${personCount} missing persons detected:</strong></p>
+                        <ul>`;
+
                 uniquePersons.forEach(personName => {
-                    const personMatches = matchesByPerson[personName];
-                    const bestMatch = personMatches.reduce((best, current) => 
-                        current.similarity > best.similarity ? current : best);
-                    
-                    html += `<li><strong>${escapeHtml(personName)}</strong> - ${bestMatch.confidence} confidence</li>`;
+
+                    const personMatches =
+                        matchesByPerson[personName];
+
+                    const bestMatch = personMatches.reduce(
+                        (best, current) =>
+                            current.similarity > best.similarity
+                                ? current
+                                : best
+                    );
+
+                    html +=
+                        `<li>
+                            <strong>${escapeHtml(personName)}</strong>
+                            - ${bestMatch.confidence} confidence
+                        </li>`;
                 });
-                
+
                 html += `</ul></div>`;
             }
 
-            // Show individual match details
+            // Show individual match details.
             uniquePersons.forEach(personName => {
-                const personMatches = matchesByPerson[personName];
-                const bestMatch = personMatches.reduce((best, current) => 
-                    current.similarity > best.similarity ? current : best);
-                
+
+                const personMatches =
+                    matchesByPerson[personName];
+
+                const bestMatch = personMatches.reduce(
+                    (best, current) =>
+                        current.similarity > best.similarity
+                            ? current
+                            : best
+                );
+
                 html += `
                     <div class="match-item">
+
                         <h3>${escapeHtml(personName)}</h3>
-                        <div class="confidence">Best Confidence: ${bestMatch.confidence}</div>
+
+                        <div class="confidence">
+                            Best Confidence: ${bestMatch.confidence}
+                        </div>
+
                         <div class="details">
-                            <strong>Similarity Score:</strong> ${(bestMatch.similarity * 100).toFixed(2)}%<br>
-                            <strong>Face Index:</strong> ${bestMatch.face_index !== undefined ? bestMatch.face_index : 'N/A'}<br>
-                            <strong>Added:</strong> ${new Date(bestMatch.created_at).toLocaleString()}
+
+                            <strong>Similarity Score:</strong>
+                            ${(bestMatch.similarity * 100).toFixed(2)}%
+                            <br>
+
+                            <strong>Face Index:</strong>
+                            ${bestMatch.face_index !== undefined
+                                ? bestMatch.face_index
+                                : 'N/A'}
+                            <br>
+
+                            <strong>Added:</strong>
+                            ${bestMatch.created_at
+                                ? new Date(bestMatch.created_at).toLocaleString()
+                                : 'N/A'}
+
                         </div>
                     </div>
                 `;
             });
-            
+
             container.innerHTML = html;
         }
 
-        // Helper function to show messages
+
+        // ==========================================
+        // SHOW MESSAGE
+        // ==========================================
+
         function showMessage(elementId, message, type) {
-            const element = document.getElementById(elementId);
+
+            const element =
+                document.getElementById(elementId);
+
             element.textContent = message;
-            element.className = `message ${type} show`;
+
+            element.className =
+                `message ${type} show`;
+
             setTimeout(() => {
+
                 element.classList.remove('show');
+
             }, 5000);
         }
 
-        // Helper function to escape HTML
+
+        // ==========================================
+        // ESCAPE HTML
+        // ==========================================
+
         function escapeHtml(text) {
+
             const div = document.createElement('div');
+
             div.textContent = text;
+
             return div.innerHTML;
         }
 
-        // Initialize status indicator
-        statusIndicator.classList.add('inactive');
 
-        // Show alert function
+        // ==========================================
+        // EXISTING ALERT FUNCTION PRESERVED
+        // ==========================================
+
         function showAlert(data) {
-            const alertBanner = document.getElementById('alertBanner');
-            
+
+            const alertBanner =
+                document.getElementById('alertBanner');
+
+            let personCount;
+            let namesStr;
+
             if (data.multiple_persons) {
-                // Multiple persons alert
-                const personCount = data.person_count;
+
+                personCount = data.person_count;
+
                 const personNames = data.person_names;
-                
-                let namesStr;
+
                 if (personCount === 2) {
-                    namesStr = `${personNames[0]} and ${personNames[1]}`;
+
+                    namesStr =
+                        `${personNames[0]} and ${personNames[1]}`;
+
                 } else {
-                    namesStr = personNames.slice(0, -1).join(', ') + ` and ${personNames[personNames.length - 1]}`;
+
+                    namesStr =
+                        personNames.slice(0, -1).join(', ') +
+                        ` and ${personNames[personNames.length - 1]}`;
                 }
-                
+
                 alertBanner.innerHTML = `
-                    🚨🚨 <strong>MULTIPLE ALERT:</strong> ${personCount} missing persons found!<br>
-                    <strong>${namesStr}</strong><br>
-                    <small>Time: ${new Date(data.timestamp).toLocaleString()}</small>
+                    🚨🚨 <strong>MULTIPLE ALERT:</strong>
+                    ${personCount} missing persons found!<br>
+
+                    <strong>${escapeHtml(namesStr)}</strong><br>
+
+                    <small>
+                        Time: ${new Date(data.timestamp).toLocaleString()}
+                    </small>
                 `;
-                
-                // Show detailed breakdown
-                const detailsHtml = data.persons_found.map(person => 
-                    `<div>• ${person.name}: ${person.confidence}</div>`
+
+                const detailsHtml = data.persons_found.map(person =>
+                    `<div>
+                        • ${escapeHtml(person.name)}: ${escapeHtml(person.confidence)}
+                    </div>`
                 ).join('');
-                alertBanner.innerHTML += `<div style="margin-top: 10px; font-size: 0.9em;">${detailsHtml}</div>`;
+
+                alertBanner.innerHTML +=
+                    `<div style="margin-top: 10px; font-size: 0.9em;">
+                        ${detailsHtml}
+                    </div>`;
+
             } else {
-                // Single person alert
+
                 alertBanner.innerHTML = `
-                    🚨 <strong>ALERT:</strong> ${escapeHtml(data.person_name)} detected!<br>
-                    <small>Confidence: ${data.confidence} | Time: ${new Date(data.timestamp).toLocaleString()}</small>
+                    🚨 <strong>ALERT:</strong>
+                    ${escapeHtml(data.person_name)} detected!<br>
+
+                    <small>
+                        Confidence: ${escapeHtml(data.confidence)}
+                        | Time: ${new Date(data.timestamp).toLocaleString()}
+                    </small>
                 `;
             }
-            
+
             alertBanner.classList.add('show');
-            
-            // Keep alert visible longer for critical alerts
-            const duration = data.multiple_persons ? 15000 : 10000; // 15s for multiple, 10s for single
+
+            const duration =
+                data.multiple_persons ? 15000 : 10000;
+
             setTimeout(() => {
+
                 alertBanner.classList.remove('show');
+
             }, duration);
-            
-            // Also show browser notification if permitted
-            if ('Notification' in window && Notification.permission === 'granted') {
-                const notificationTitle = data.multiple_persons ? 
-                    `Multiple Missing Persons Found (${personCount})` : 
-                    `Missing Person Found: ${data.person_name}`;
-                const notificationBody = data.multiple_persons ? 
-                    `${namesStr} detected` : 
-                    `Confidence: ${data.confidence}`;
-                
+
+
+            // Browser notification - existing functionality preserved.
+            if (
+                'Notification' in window &&
+                Notification.permission === 'granted'
+            ) {
+
+                const notificationTitle = data.multiple_persons
+                    ? `Multiple Missing Persons Found (${personCount})`
+                    : `Missing Person Found: ${data.person_name}`;
+
+                const notificationBody = data.multiple_persons
+                    ? `${namesStr} detected`
+                    : `Confidence: ${data.confidence}`;
+
                 new Notification(notificationTitle, {
+
                     body: notificationBody,
+
                     icon: '/static/alert-icon.png',
+
                     tag: 'missing-person-alert'
                 });
             }
         }
 
-        // Play alert sound
+
+        // ==========================================
+        // EXISTING ALERT SOUND PRESERVED
+        // ==========================================
+
         function playAlertSound() {
+
             try {
-                // Create audio context and play alert sound
-                const audioContext = new (window.AudioContext || window.webkitAudioContext)();
-                const oscillator = audioContext.createOscillator();
-                const gainNode = audioContext.createGain();
-                
+
+                const audioContext = new (
+                    window.AudioContext ||
+                    window.webkitAudioContext
+                )();
+
+                const oscillator =
+                    audioContext.createOscillator();
+
+                const gainNode =
+                    audioContext.createGain();
+
                 oscillator.connect(gainNode);
+
                 gainNode.connect(audioContext.destination);
-                
-                oscillator.frequency.setValueAtTime(800, audioContext.currentTime);
-                oscillator.frequency.setValueAtTime(600, audioContext.currentTime + 0.1);
-                oscillator.frequency.setValueAtTime(800, audioContext.currentTime + 0.2);
-                
-                gainNode.gain.setValueAtTime(0.3, audioContext.currentTime);
-                gainNode.gain.exponentialRampToValueAtTime(0.01, audioContext.currentTime + 0.5);
-                
+
+                oscillator.frequency.setValueAtTime(
+                    800,
+                    audioContext.currentTime
+                );
+
+                oscillator.frequency.setValueAtTime(
+                    600,
+                    audioContext.currentTime + 0.1
+                );
+
+                oscillator.frequency.setValueAtTime(
+                    800,
+                    audioContext.currentTime + 0.2
+                );
+
+                gainNode.gain.setValueAtTime(
+                    0.3,
+                    audioContext.currentTime
+                );
+
+                gainNode.gain.exponentialRampToValueAtTime(
+                    0.01,
+                    audioContext.currentTime + 0.5
+                );
+
                 oscillator.start(audioContext.currentTime);
-                oscillator.stop(audioContext.currentTime + 0.5);
+
+                oscillator.stop(
+                    audioContext.currentTime + 0.5
+                );
+
             } catch (error) {
-                console.log('Could not play alert sound:', error);
+
+                console.log(
+                    'Could not play alert sound:',
+                    error
+                );
             }
         }
-    <script src="https://cdnjs.cloudflare.com/ajax/libs/socket.io/4.7.2/socket.io.js"></script>
+
+    </script>
+
 </body>
 </html>
+
+
+
+
+

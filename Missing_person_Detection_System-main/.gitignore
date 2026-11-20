@@ -1,0 +1,29 @@
+# Ignore streams configuration
+streams/
+
+# Python environments
+**/venv/
+**/.venv/
+**/.venv-1/
+**/__pycache__/
+
+# Private files
+**/.env
+**/stored_embeddings.json
+**/cameras.json
+
+# Logs
+*.log
+
+# Generated data
+**/uploads/
+**/snapshots/
+**/evidence/
+
+# LFW datasets
+**/lfw_experiment/gallery/
+**/lfw_experiment/probe/
+**/lfw_experiment/name_mapping.json
+**/lfw_experiment_original/gallery/
+**/lfw_experiment_original/probe/
+**/lfw_experiment_original/name_mapping.json
