@@ -330,15 +330,13 @@ docker run -p 5000:5000 missing-person-detection:latest
 
 # 👨‍💻 Developed By
 
-## Ganesh Kute
-##Atharva Jaybhaye
-##Gaurav Nandy
-GUIDE:Prof.Viddulata Patil
+## Paras Goyal
+## Mishti Sharma
 
 
-B.Tech CSE (AI & Edge Computing)
+B.Tech CSE
 
-Final Year Major Project
+Final Year Minor Project
 
 ---
 
@@ -365,7 +363,7 @@ If you found this project useful:
 GitHub
 
 ```text
-https://github.com/ganeshkute18
+https://github.com/parasgoyal05
 ```
 
 ---
@@ -376,8 +374,7 @@ https://github.com/ganeshkute18
 ✅ Computer Vision Based
 ✅ Deep Learning Integrated
 ✅ CCTV Monitoring Support
-✅ Alert & Evidence System
-✅ Final Year Major Project
+✅ Final Year Minor Project
 ✅ Docker & GPU Ready
 ✅ Scalable Architecture
 
