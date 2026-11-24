@@ -1,0 +1,75 @@
+
+<!doctype html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width,initial-scale=1">
+    <title>FindTrace AI | Public Portal</title>
+    <link rel="stylesheet" href="{{ url_for('static', filename='css/main.css') }}">
+</head>
+
+<body>
+<div class="shell">
+
+    <nav class="nav">
+        <a class="brand" href="/">FIND<span>TRACE</span> AI</a>
+        <div class="navlinks">
+            <a href="/report">Report a Person</a>
+            <a href="/track">Track Case</a>
+            <a href="/admin">Admin</a>
+        </div>
+    </nav>
+
+    <section class="hero">
+        <div class="eyebrow">Missing Person Assistance Portal</div>
+
+        <h1>
+            Every lead matters.<br>
+            <span style="color:var(--cyan)">Every person matters.</span>
+        </h1>
+
+        <p>
+            Submit a missing-person report and receive a unique Case ID,
+            or use your Case ID to check the latest review status.
+            Reports are verified by authorised administrators before
+            being added to FindTrace recognition.
+        </p>
+    </section>
+
+    <div class="grid">
+        <article class="panel">
+            <div class="icon">＋</div>
+            <h2>Report Missing Person</h2>
+            <p>
+                Share the person's details, a clear photograph,
+                last-seen information and your contact details.
+                You will receive a Case ID after successful submission.
+            </p>
+            <a class="small-link" href="/report">Start a report →</a>
+        </article>
+
+        <article class="panel">
+            <div class="icon">⌕</div>
+            <h2>Track Your Case</h2>
+            <p>
+                Enter the Case ID received after submission to see
+                whether your report is pending, approved or rejected.
+            </p>
+            <a class="small-link" href="/track">Check case status →</a>
+        </article>
+    </div>
+
+    <div class="notice">
+        Privacy & verification: reporter contact details are visible
+        only to authorised administrators. A public submission does
+        not enter face recognition until an administrator approves it.
+    </div>
+
+    <footer class="footer">
+        FindTrace AI · Public reporting portal · If someone is in
+        immediate danger, contact local emergency services.
+    </footer>
+
+</div>
+</body>
+</html>

@@ -2,14 +2,18 @@
 Flask Backend API for Missing Person Detection
 Handles face embedding computation and storage using DeepFace
 """
-
+from dotenv import load_dotenv
+load_dotenv()
 import os
 import sys
 import json
-from flask import Flask, request, jsonify, render_template, Response
+from flask import Flask, request, jsonify, render_template, Response, session
 from flask_cors import CORS
 from flask_socketio import SocketIO, emit
 from werkzeug.utils import secure_filename
+from werkzeug.security import generate_password_hash, check_password_hash
+from flask_migrate import Migrate
+from flask_sqlalchemy import SQLAlchemy
 import numpy as np
 from datetime import datetime
 from sklearn.metrics.pairwise import cosine_similarity
@@ -21,6 +25,8 @@ from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 import logging
 import time
+import secrets
+from functools import wraps
 
 # Fix Windows encoding issues
 if sys.platform == 'win32':
@@ -241,7 +247,479 @@ match_last_emitted = {}
 
 # Initialize Flask app
 app = Flask(__name__)
-CORS(app)  # Enable CORS for frontend
+app.config["SECRET_KEY"] = os.getenv("FLASK_SECRET_KEY", secrets.token_hex(32))
+app.config["SESSION_COOKIE_HTTPONLY"] = True
+app.config["SESSION_COOKIE_SAMESITE"] = "Lax"
+CORS(app, supports_credentials=True)
+
+# ================= POSTGRESQL CONFIGURATION =================
+
+from flask_sqlalchemy import SQLAlchemy
+from sqlalchemy import text
+
+DATABASE_URL = os.getenv("DATABASE_URL")
+if not DATABASE_URL:
+    raise RuntimeError(
+        "DATABASE_URL is not set. Configure it as an environment variable "
+        "before starting FindTrace (do not hardcode database credentials in app.py)."
+    )
+app.config["SQLALCHEMY_DATABASE_URI"] = DATABASE_URL
+
+app.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = False
+
+db = SQLAlchemy(app)
+migrate = Migrate(app, db)
+
+
+# ================= DATABASE MODELS =================
+
+# ================= DATABASE MODELS =================
+
+class Person(db.Model):
+    __tablename__ = "persons"
+
+    id = db.Column(db.Integer, primary_key=True)
+
+    # Identity
+    name = db.Column(db.String(150), nullable=False, index=True)
+    age = db.Column(db.Integer, nullable=True)
+    gender = db.Column(db.String(30), nullable=True)
+
+    # Missing person information
+    last_seen_location = db.Column(db.String(255), nullable=True)
+    last_seen_date = db.Column(db.DateTime, nullable=True)
+    contact_info = db.Column(db.String(100), nullable=True)
+    contact_phone = db.Column(db.String(30), nullable=True)
+    contact_email = db.Column(db.String(150), nullable=True)
+    description = db.Column(db.Text, nullable=True)
+
+    # Case management
+    case_status = db.Column(
+        db.String(30),
+        nullable=False,
+        default="active",
+        index=True
+    )
+
+    # Registration metadata
+    created_at = db.Column(db.DateTime, default=datetime.utcnow, nullable=False)
+    updated_at = db.Column(
+        db.DateTime,
+        default=datetime.utcnow,
+        onupdate=datetime.utcnow,
+        nullable=False
+    )
+    image_filename = db.Column(db.String(255), nullable=True)
+    uploader_ip = db.Column(db.String(50), nullable=True)
+    source = db.Column(db.String(100), nullable=True)
+
+    # Relationships
+    embeddings = db.relationship(
+        "FaceEmbedding",
+        backref="person",
+        cascade="all, delete-orphan",
+        lazy=True
+    )
+
+    match_events = db.relationship(
+        "MatchEvent",
+        backref="person",
+        lazy=True
+    )
+
+
+class FaceEmbedding(db.Model):
+    __tablename__ = "face_embeddings"
+
+    id = db.Column(db.Integer, primary_key=True)
+
+    person_id = db.Column(
+        db.Integer,
+        db.ForeignKey("persons.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True
+    )
+
+    # ArcFace embedding
+    embedding = db.Column(db.JSON, nullable=False)
+    embedding_dimension = db.Column(
+        db.Integer,
+        nullable=False,
+        default=512
+    )
+    is_normalized = db.Column(
+        db.Boolean,
+        nullable=False,
+        default=True
+    )
+
+    # Model information
+    model_name = db.Column(
+        db.String(100),
+        nullable=False,
+        default="buffalo_l"
+    )
+    model_version = db.Column(db.String(50), nullable=True)
+
+    image_filename = db.Column(db.String(255), nullable=True)
+    created_at = db.Column(
+        db.DateTime,
+        default=datetime.utcnow,
+        nullable=False
+    )
+
+    __table_args__ = (
+        db.CheckConstraint(
+            "embedding_dimension > 0",
+            name="ck_embedding_dimension_positive"
+        ),
+    )
+
+
+class Camera(db.Model):
+    __tablename__ = "cameras"
+
+    id = db.Column(db.Integer, primary_key=True)
+
+    camera_name = db.Column(db.String(150), nullable=False)
+    camera_type = db.Column(db.String(50), nullable=False)
+
+    # Webcam index, RTSP URL, IP camera URL, etc.
+    source = db.Column(db.Text, nullable=False, unique=True)
+
+    location = db.Column(db.String(255), nullable=True)
+
+    status = db.Column(
+        db.String(50),
+        nullable=False,
+        default="configured"
+    )
+
+    is_active = db.Column(
+        db.Boolean,
+        nullable=False,
+        default=True
+    )
+
+    created_at = db.Column(db.DateTime, default=datetime.utcnow, nullable=False)
+    updated_at = db.Column(
+        db.DateTime,
+        default=datetime.utcnow,
+        onupdate=datetime.utcnow,
+        nullable=False
+    )
+
+
+class MatchEvent(db.Model):
+    __tablename__ = "match_events"
+
+    id = db.Column(db.Integer, primary_key=True)
+
+    person_id = db.Column(
+        db.Integer,
+        db.ForeignKey("persons.id"),
+        nullable=False,
+        index=True
+    )
+
+    camera_id = db.Column(
+        db.Integer,
+        db.ForeignKey("cameras.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True
+    )
+
+    # Cosine similarity score
+    similarity = db.Column(db.Float, nullable=False)
+
+    camera_source = db.Column(db.String(255), nullable=True)
+    snapshot_path = db.Column(db.String(500), nullable=True)
+
+    review_status = db.Column(
+        db.String(30),
+        nullable=False,
+        default="pending"
+    )
+
+    detected_at = db.Column(
+        db.DateTime,
+        default=datetime.utcnow,
+        nullable=False,
+        index=True
+    )
+
+    camera = db.relationship("Camera", backref="match_events")
+
+    __table_args__ = (
+        db.CheckConstraint(
+            "similarity >= -1 AND similarity <= 1",
+            name="ck_match_similarity_range"
+        ),
+        db.Index(
+            "ix_match_person_detected",
+            "person_id",
+            "detected_at"
+        ),
+    )
+
+
+class AuditLog(db.Model):
+    __tablename__ = "audit_logs"
+
+    id = db.Column(db.Integer, primary_key=True)
+
+    event_type = db.Column(db.String(100), nullable=False, index=True)
+    description = db.Column(db.Text, nullable=False)
+
+    user = db.Column(
+        db.String(150),
+        nullable=False,
+        default="system"
+    )
+
+    ip_address = db.Column(db.String(50), nullable=True)
+
+    action_status = db.Column(
+        db.String(30),
+        nullable=False,
+        default="success"
+    )
+
+    details = db.Column(db.JSON, nullable=True)
+
+    timestamp = db.Column(
+        db.DateTime,
+        default=datetime.utcnow,
+        nullable=False,
+        index=True
+    )
+
+# ================= PUBLIC CASES & ADMIN AUTH =================
+
+class Admin(db.Model):
+    __tablename__ = "admins"
+
+    id = db.Column(db.Integer, primary_key=True)
+    username = db.Column(db.String(80), unique=True, nullable=False, index=True)
+    password_hash = db.Column(db.String(255), nullable=False)
+    created_at = db.Column(db.DateTime, default=datetime.utcnow, nullable=False)
+
+
+class CaseSubmission(db.Model):
+    __tablename__ = "case_submissions"
+
+    id = db.Column(db.Integer, primary_key=True)
+    case_id = db.Column(db.String(24), unique=True, nullable=False, index=True)
+
+    # Person details supplied by the public
+    person_name = db.Column(db.String(150), nullable=False)
+    age = db.Column(db.Integer, nullable=True)
+    gender = db.Column(db.String(30), nullable=True)
+    last_seen_location = db.Column(db.String(255), nullable=False)
+    last_seen_date = db.Column(db.DateTime, nullable=True)
+    description = db.Column(db.Text, nullable=True)
+    image_filename = db.Column(db.String(255), nullable=False)
+
+    # Reporter details are private and are never returned by public tracking
+    reporter_name = db.Column(db.String(150), nullable=False)
+    reporter_phone = db.Column(db.String(30), nullable=False)
+    reporter_email = db.Column(db.String(150), nullable=True)
+
+    status = db.Column(db.String(20), nullable=False, default="pending", index=True)
+    review_note = db.Column(db.Text, nullable=True)
+    reviewed_by = db.Column(db.String(80), nullable=True)
+    reviewed_at = db.Column(db.DateTime, nullable=True)
+    person_id = db.Column(db.Integer, db.ForeignKey("persons.id"), nullable=True)
+    submitted_at = db.Column(db.DateTime, default=datetime.utcnow, nullable=False)
+
+
+def admin_required(fn):
+    """Protect JSON/API endpoints with the authenticated admin session."""
+    @wraps(fn)
+    def decorated(*args, **kwargs):
+        if not session.get("admin_id"):
+            return jsonify({"success": False, "error": "Admin login required"}), 401
+        return fn(*args, **kwargs)
+    return decorated
+
+
+def admin_page_required(fn):
+    """Send unauthenticated visitors to the admin sign-in page."""
+    @wraps(fn)
+    def decorated(*args, **kwargs):
+        if not session.get("admin_id"):
+            from flask import redirect, url_for
+            return redirect(url_for("admin_page"))
+        return fn(*args, **kwargs)
+    return decorated
+
+
+def create_case_id():
+    # Human-readable prefix plus a cryptographically random suffix.
+    return "FT-" + secrets.token_hex(5).upper()
+
+
+def case_submission_payload(case, include_private=False):
+    payload = {
+        "id": case.id,
+        "case_id": case.case_id,
+        "person_name": case.person_name,
+        "age": case.age,
+        "gender": case.gender,
+        "last_seen_location": case.last_seen_location,
+        "last_seen_date": case.last_seen_date.isoformat() if case.last_seen_date else None,
+        "description": case.description,
+        "image_url": f"/uploads/{case.image_filename}",
+        "status": case.status,
+        "review_note": case.review_note,
+        "submitted_at": case.submitted_at.isoformat() if case.submitted_at else None,
+        "reviewed_at": case.reviewed_at.isoformat() if case.reviewed_at else None,
+        "person_id": case.person_id,
+    }
+    if include_private:
+        payload.update({
+            "reporter_name": case.reporter_name,
+            "reporter_phone": case.reporter_phone,
+            "reporter_email": case.reporter_email,
+            "reviewed_by": case.reviewed_by,
+        })
+    return payload
+
+
+print("PostgreSQL configuration loaded")
+
+def get_or_create_camera_record(name, source, camera_type=None, location=None):
+    """Create or update a camera record in PostgreSQL, keyed by source."""
+    source_key = str(source)
+    inferred_type = camera_type or (
+        "webcam" if source_key.isdigit()
+        else "ip_camera" if source_key.lower().startswith(("rtsp://", "rtsps://", "http://", "https://"))
+        else "camera"
+    )
+    camera = Camera.query.filter_by(source=source_key).first()
+    if camera is None:
+        camera = Camera(
+            camera_name=(name or source_key)[:150],
+            camera_type=inferred_type[:50],
+            source=source_key,
+            location=location,
+            status="configured",
+            is_active=True
+        )
+        db.session.add(camera)
+    else:
+        camera.camera_name = (name or camera.camera_name)[:150]
+        camera.camera_type = inferred_type[:50]
+        if location:
+            camera.location = location
+        camera.is_active = True
+    db.session.flush()
+    return camera
+
+
+def set_camera_status(source, status, is_active=None):
+    """Update a configured camera's operational status in PostgreSQL."""
+    try:
+        with app.app_context():
+            camera = Camera.query.filter_by(source=str(source)).first()
+            if camera:
+                camera.status = status
+                if is_active is not None:
+                    camera.is_active = is_active
+                db.session.commit()
+    except Exception:
+        try:
+            with app.app_context():
+                db.session.rollback()
+        except Exception:
+            pass
+        logging.exception("Could not update camera status in PostgreSQL")
+
+
+def save_match_event(match, camera_source, camera_id=None, snapshot_path=None):
+    """Persist a deduplicated face match in PostgreSQL."""
+    try:
+        with app.app_context():
+            person_id = match.get("person_id")
+            person = None
+            if person_id is not None:
+                try:
+                    person = db.session.get(Person, int(person_id))
+                except (TypeError, ValueError):
+                    person = None
+            if person is None:
+                person = Person.query.filter_by(name=match.get("name")).first()
+            if person is None:
+                logging.warning("Skipping match event: person %r not found", match.get("name"))
+                return False
+
+            camera = db.session.get(Camera, camera_id) if camera_id else None
+            if camera is None:
+                camera = Camera.query.filter_by(source=str(camera_source)).first()
+
+            raw_similarity = match.get("similarity", match.get("confidence", 0))
+            if isinstance(raw_similarity, str):
+                raw_similarity = raw_similarity.strip()
+                raw_similarity = float(raw_similarity.replace("%", "")) / (100 if "%" in raw_similarity else 1)
+            similarity = max(-1.0, min(1.0, float(raw_similarity)))
+
+            db.session.add(MatchEvent(
+                person_id=person.id,
+                camera_id=camera.id if camera else None,
+                similarity=similarity,
+                camera_source=str(camera_source)[:255] if camera_source is not None else None,
+                snapshot_path=snapshot_path,
+                review_status="pending",
+                detected_at=datetime.utcnow()
+            ))
+            db.session.commit()
+            return True
+    except Exception:
+        db.session.rollback()
+        logging.exception("Could not save match event in PostgreSQL")
+        return False
+
+
+
+
+
+@app.route('/create-tables')
+def create_tables():
+    try:
+        db.create_all()
+
+        return jsonify({
+            "success": True,
+            "message": "All FindTrace database tables created!"
+        }), 200
+
+    except Exception as e:
+        logging.exception("Database table creation failed")
+
+        return jsonify({
+            "success": False,
+            "error": str(e)
+        }), 500
+
+@app.route('/test-db')
+def test_db():
+    try:
+        with db.engine.connect() as connection:
+            connection.execute(text("SELECT 1"))
+
+        return jsonify({
+            "success": True,
+            "message": "PostgreSQL connected successfully!"
+        }), 200
+
+    except Exception as e:
+        return jsonify({
+            "success": False,
+            "error": str(e)
+        }), 500
+
+
+
 socketio = SocketIO(
     app,
     cors_allowed_origins="*",
@@ -301,12 +779,76 @@ realtime_detector = RealTimeDetector(embeddings_file=EMBEDDINGS_FILE, threshold=
 stream_processor = VideoStreamProcessor(realtime_detector)
 processing_thread = None
 
+
+def load_postgres_embeddings():
+    """Load the latest face embeddings from PostgreSQL into the detector."""
+    try:
+        records = (
+            db.session.query(Person, FaceEmbedding)
+            .join(FaceEmbedding, FaceEmbedding.person_id == Person.id)
+            .filter(Person.case_status == "active")
+            .order_by(FaceEmbedding.created_at.desc())
+            .all()
+        )
+
+        embeddings_dict = {}
+        for person, face_record in records:
+            vector = face_record.embedding
+            if not isinstance(vector, (list, tuple)) or len(vector) != 512:
+                logging.warning(
+                    "Skipping invalid embedding for person %s (id=%s)",
+                    person.name, person.id
+                )
+                continue
+
+            # Keep the newest embedding for each person name.
+            embeddings_dict.setdefault(person.name, {
+                "embedding": vector,
+                "created_at": (
+                    face_record.created_at.isoformat()
+                    if face_record.created_at else None
+                ),
+                "image_filename": face_record.image_filename or person.image_filename,
+                "person_id": person.id
+            })
+
+        realtime_detector.load_embeddings_from_dict(embeddings_dict)
+        print(
+            f"[PostgreSQL] Loaded {len(realtime_detector.stored_embeddings_np)} "
+            "face embeddings into the detector"
+        )
+        return len(realtime_detector.stored_embeddings_np)
+
+    except Exception:
+        db.session.rollback()
+        logging.exception("Could not load face embeddings from PostgreSQL")
+        raise
+
+
+# Load database embeddings after the detector and SQLAlchemy models are ready.
+with app.app_context():
+    load_postgres_embeddings()
+
+
 # Create uploads directory if it doesn't exist
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 
 # Set maximum file size (16MB)
 app.config['MAX_CONTENT_LENGTH'] = 16 * 1024 * 1024
 app.config['UPLOAD_FOLDER'] = UPLOAD_FOLDER
+os.makedirs(app.config['UPLOAD_FOLDER'], exist_ok=True)
+
+@app.route('/uploads/<path:filename>', methods=['GET'])
+@admin_required
+def serve_uploaded_image(filename):
+    """Serve registered missing-person photographs."""
+    from flask import send_from_directory
+
+    return send_from_directory(
+        app.config['UPLOAD_FOLDER'],
+        filename
+    )
+
 
 def stream_callback(result, frame):
 
@@ -356,6 +898,75 @@ def load_embeddings():
     return {}
 
 
+@app.route('/preview-json-migration', methods=['GET'])
+@admin_required
+def preview_json_migration():
+    try:
+        if not os.path.exists(EMBEDDINGS_FILE):
+            return jsonify({
+                "success": False,
+                "error": "stored_embeddings.json not found"
+            }), 404
+
+        embeddings_dict = load_embeddings()
+
+        if not isinstance(embeddings_dict, dict):
+            return jsonify({
+                "success": False,
+                "error": "Invalid JSON structure"
+            }), 400
+
+        existing_names = {
+            name for (name,) in
+            db.session.query(Person.name).all()
+        }
+
+        valid = 0
+        invalid = 0
+        already_exists = 0
+
+        for name, data in embeddings_dict.items():
+            if not isinstance(data, dict):
+                invalid += 1
+                continue
+
+            embedding = data.get("embedding")
+
+            try:
+                vector = np.asarray(embedding, dtype=np.float32)
+
+                if vector.shape != (512,) or not np.isfinite(vector).all():
+                    invalid += 1
+                    continue
+
+            except (TypeError, ValueError):
+                invalid += 1
+                continue
+
+            if not isinstance(name, str) or not name.strip():
+                invalid += 1
+            elif name in existing_names:
+                already_exists += 1
+            else:
+                valid += 1
+
+        return jsonify({
+            "success": True,
+            "total_json_records": len(embeddings_dict),
+            "ready_to_migrate": valid,
+            "invalid_records": invalid,
+            "already_in_postgres": already_exists,
+            "database_connection": "successful"
+        }), 200
+
+    except Exception as e:
+        logging.exception("Migration preview failed")
+        return jsonify({
+            "success": False,
+            "error": str(e)
+        }), 500
+
+
 def save_embeddings(embeddings_dict):
     """Save embeddings dictionary to JSON file"""
     try:
@@ -399,315 +1010,515 @@ def compute_face_embedding(image_path):
 
 
 def find_matching_person(detected_embedding, threshold=0.6):
-    """
-    Find matching person from stored embeddings using cosine similarity
-    Returns list of matches with similarity scores
-    """
-    embeddings_dict = load_embeddings()
+    """Compare a supplied face embedding against embeddings loaded from PostgreSQL."""
     matches = []
-    
-    if not embeddings_dict:
+    if not getattr(realtime_detector, "stored_embeddings_np", None):
         return matches
-    
-    detected_embedding_np = np.array(detected_embedding).reshape(1, -1)
-    
-    for name, data in embeddings_dict.items():
-        stored_embedding = np.array(data.get('embedding')).reshape(1, -1)
-        
-        # Calculate cosine similarity
-        similarity = cosine_similarity(detected_embedding_np, stored_embedding)[0][0]
-        
+
+    detected = np.asarray(detected_embedding, dtype=np.float32).reshape(1, -1)
+    if detected.shape[1] != 512 or not np.isfinite(detected).all():
+        return matches
+
+    for name, stored_embedding in realtime_detector.stored_embeddings_np.items():
+        stored = np.asarray(stored_embedding, dtype=np.float32).reshape(1, -1)
+        if stored.shape != detected.shape or not np.isfinite(stored).all():
+            continue
+
+        similarity = float(cosine_similarity(detected, stored)[0][0])
         if similarity >= threshold:
+            metadata = realtime_detector.stored_embeddings.get(name, {})
             matches.append({
-                'name': name,
-                'similarity': float(similarity),
-                'confidence': f"{similarity * 100:.2f}%",
-                'created_at': data.get('created_at')
+                "name": name,
+                "similarity": similarity,
+                "confidence": f"{similarity * 100:.2f}%",
+                "created_at": metadata.get("created_at")
             })
-    
-    # Sort by similarity (highest first)
-    matches.sort(key=lambda x: x['similarity'], reverse=True)
+
+    matches.sort(key=lambda item: item["similarity"], reverse=True)
     return matches
 
 
+
+
 @app.route('/target_person', methods=['POST'])
+@admin_required
 def add_target_person():
-    """
-    POST endpoint to add a missing person
-    Accepts form data: 'name' (string) and 'image' (file upload)
-    Returns JSON response with success status
-    """
-    # Check if name is provided
+    """Register a missing person and their 512-dimensional face embedding in PostgreSQL."""
+    filepath = None
+
     if 'name' not in request.form:
-        return jsonify({
-            'success': False,
-            'error': 'Missing required field: name'
-        }), 400
-    
-    # Check if image file is provided
+        return jsonify({'success': False, 'error': 'Missing required field: name'}), 400
+
     if 'image' not in request.files:
-        return jsonify({
-            'success': False,
-            'error': 'Missing required field: image'
-        }), 400
-    
-    name = request.form['name'].strip()
+        return jsonify({'success': False, 'error': 'Missing required field: image'}), 400
+
+    name = request.form.get('name', '').strip()
     image_file = request.files['image']
-    
-    # Validate name
+
     if not name:
-        return jsonify({
-            'success': False,
-            'error': 'Name cannot be empty'
-        }), 400
-    
-    # Validate file
+        return jsonify({'success': False, 'error': 'Name cannot be empty'}), 400
+
     if image_file.filename == '':
-        return jsonify({
-            'success': False,
-            'error': 'No file selected'
-        }), 400
-    
+        return jsonify({'success': False, 'error': 'No file selected'}), 400
+
     if not allowed_file(image_file.filename):
         return jsonify({
             'success': False,
-            'error': f'Invalid file type. Allowed types: {", ".join(ALLOWED_EXTENSIONS)}'
+            'error': f'Invalid file type. Allowed types: {", ".join(sorted(ALLOWED_EXTENSIONS))}'
         }), 400
-    
-    # Save uploaded file temporarily
+
+    # The existing endpoint treats a repeated name as a conflict.
+    if Person.query.filter_by(name=name).first():
+        return jsonify({
+            'success': False,
+            'error': f'Person with name "{name}" already exists.'
+        }), 409
+
     filename = secure_filename(image_file.filename)
-    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S_%f')
     unique_filename = f"{timestamp}_{filename}"
     filepath = os.path.join(app.config['UPLOAD_FOLDER'], unique_filename)
-    
+
     try:
         image_file.save(filepath)
-        
-        # Compute face embedding
+
         embedding = compute_face_embedding(filepath)
-        
         if embedding is None:
-            # Clean up uploaded file
             if os.path.exists(filepath):
                 os.remove(filepath)
             return jsonify({
                 'success': False,
-                'error': 'No face detected in the image. Please ensure:\n' +
-                         '1. The image contains a clear, front-facing face\n' +
-                         '2. The face is well-lit and not obscured\n' +
-                         '3. The image is not too blurry or low quality\n' +
-                         '4. Try a different image with better lighting and angle'
+                'error': (
+                    'No face detected in the image. Please upload a clear, '
+                    'well-lit, front-facing face image.'
+                )
             }), 400
-        
-        # Load existing embeddings
-        embeddings_dict = load_embeddings()
-        
-        # Check if name already exists
-        if name in embeddings_dict:
-            return jsonify({
-                'success': False,
-                'error': f'Person with name "{name}" already exists. Use a different name or update existing entry.'
-            }), 409
-        
-        # Store embedding with metadata
-        # Normalize embedding and store metadata
-        try:
-            emb_np = np.array(embedding, dtype=float)
-            norm = np.linalg.norm(emb_np)
-            if norm > 0:
-                emb_np = (emb_np / norm).tolist()
-            else:
-                emb_np = emb_np.tolist()
-        except Exception:
-            emb_np = embedding
 
-        embeddings_dict[name] = {
-            'embedding': emb_np,
-            'created_at': datetime.now().isoformat(),
-            'image_filename': unique_filename,
-            'uploader_ip': request.remote_addr,
-            'source': 'manual_upload'
-        }
-        
-        # Save embeddings
-        if save_embeddings(embeddings_dict):
-            # Reload embeddings in real-time detector so new person is immediately available
+        vector = np.asarray(embedding, dtype=np.float32)
+        if vector.shape != (512,) or not np.isfinite(vector).all():
+            raise ValueError('Generated face embedding must contain 512 finite values.')
+
+        norm = float(np.linalg.norm(vector))
+        if norm == 0:
+            raise ValueError('Generated face embedding has zero length.')
+        vector = vector / norm
+
+        age_text = request.form.get('age', '').strip()
+        age = int(age_text) if age_text.isdigit() else None
+
+
+
+        last_seen_date = None
+        date_text = request.form.get('last_seen_date', '').strip()
+        if date_text:
             try:
-                realtime_detector.reload_embeddings()
-                print(f"Reloaded embeddings. Total persons in database: {len(realtime_detector.stored_embeddings)}")
-            except Exception as e:
-                print(f"Warning: Could not reload embeddings in real-time detector: {e}")
-            
-            # Log audit event
-            log_audit_event(
-                'PERSON_ADDED',
-                f'Added missing person: {name}',
-                details={'name': name, 'image_file': unique_filename}
-            )
-            
-            return jsonify({
-                'success': True,
-                'name': name,
-                'message': f'Successfully added missing person: {name}. Person is now available for real-time detection!',
-                'total_persons': len(embeddings_dict),
-                'ready_for_detection': True
-            }), 201
-        else:
-            return jsonify({
-                'success': False,
-                'error': 'Failed to save embedding'
-            }), 500
-            
+                last_seen_date = datetime.fromisoformat(date_text)
+            except ValueError:
+                raise ValueError('last_seen_date must be a valid ISO date or datetime.')
+
+        person = Person(
+            name=name,
+            age=age,
+            gender=request.form.get('gender') or None,
+            last_seen_location=request.form.get('last_seen_location') or None,
+            last_seen_date=last_seen_date,
+            contact_info=request.form.get('contact_info') or None,
+            contact_phone=request.form.get('contact_phone') or None,
+            contact_email=request.form.get('contact_email') or None,
+            description=request.form.get('description') or None,
+            image_filename=unique_filename,
+            uploader_ip=request.remote_addr,
+            source='manual_upload',
+            case_status='active'
+        )
+        db.session.add(person)
+        db.session.flush()
+
+        face_record = FaceEmbedding(
+            person_id=person.id,
+            embedding=vector.astype(float).tolist(),
+            embedding_dimension=512,
+            is_normalized=True,
+            model_name='buffalo_l',
+            image_filename=unique_filename
+        )
+        db.session.add(face_record)
+        db.session.commit()
+
+        # Refresh the detector's in-memory cache from PostgreSQL.
+        load_postgres_embeddings()
+
+        log_audit_event(
+            'PERSON_ADDED',
+            f'Added missing person: {name}',
+            details={'name': name, 'image_file': unique_filename, 'person_id': person.id}
+        )
+
+        return jsonify({
+            'success': True,
+            'name': name,
+            'person_id': person.id,
+            'message': f'Successfully added missing person: {name}. Person is now available for real-time detection!',
+            'total_persons': Person.query.count(),
+            'ready_for_detection': True
+        }), 201
+
     except Exception as e:
-        # Clean up uploaded file on error
-        if os.path.exists(filepath):
+        db.session.rollback()
+        if filepath and os.path.exists(filepath):
             try:
                 os.remove(filepath)
-            except:
-                pass
-        # Safely encode error message
-        error_msg = str(e)
-        try:
-            # Try to encode to ASCII, replacing problematic characters
-            error_msg = error_msg.encode('ascii', 'replace').decode('ascii')
-        except:
-            error_msg = "An error occurred while processing the request"
+            except OSError:
+                logging.warning('Could not remove failed upload: %s', filepath)
+        logging.exception('PostgreSQL person registration failed')
         return jsonify({
             'success': False,
-            'error': f'Server error: {error_msg}'
+            'error': f'Server error: {str(e)}'
         }), 500
 
 
 @app.route('/targets', methods=['GET'])
+@admin_required
 def get_targets():
-    """
-    GET endpoint to retrieve all stored missing persons
-    Returns JSON with list of names and their embeddings
-    """
+    """Return registered people and their embeddings from PostgreSQL."""
     try:
-        embeddings_dict = load_embeddings()
-        
-        # Format response with names and embeddings
+        persons = Person.query.order_by(Person.created_at.desc()).all()
         targets = []
-        for name, data in embeddings_dict.items():
+
+        for person in persons:
+            face_record = (
+                FaceEmbedding.query
+                .filter_by(person_id=person.id)
+                .order_by(FaceEmbedding.created_at.desc())
+                .first()
+            )
+
             targets.append({
-                'name': name,
-                'embedding': data.get('embedding'),
-                'created_at': data.get('created_at'),
-                'image_filename': data.get('image_filename')
+                'id': person.id,
+                'name': person.name,
+                'embedding': face_record.embedding if face_record else None,
+                'created_at': (
+                    face_record.created_at.isoformat()
+                    if face_record and face_record.created_at else
+                    person.created_at.isoformat() if person.created_at else None
+                ),
+                'image_filename': (
+                    person.image_filename
+                    or (face_record.image_filename if face_record else None)
+                ),
+                'age': person.age,
+                'gender': person.gender,
+                'last_seen_location': person.last_seen_location,
+                'last_seen_date': person.last_seen_date.isoformat() if person.last_seen_date else None,
+                'contact_info': person.contact_info,
+                'contact_phone': person.contact_phone,
+                'contact_email': person.contact_email,
+                'description': person.description,
+                'case_status': person.case_status,
+                'has_embedding': face_record is not None
             })
-        
+
         return jsonify({
             'success': True,
             'count': len(targets),
             'targets': targets
         }), 200
-        
+
     except Exception as e:
-        # Safely encode error message
-        error_msg = str(e)
-        try:
-            error_msg = error_msg.encode('ascii', 'replace').decode('ascii')
-        except:
-            error_msg = "An error occurred while retrieving targets"
+        logging.exception('Error retrieving targets from PostgreSQL')
         return jsonify({
             'success': False,
-            'error': f'Error retrieving targets: {error_msg}'
+            'error': f'Error retrieving targets: {str(e)}'
+        }), 500
+
+
+@app.route('/target_person/<int:person_id>', methods=['PATCH'])
+@admin_required
+def update_target_person(person_id):
+    filepath = None
+
+    try:
+        person = db.session.get(Person, person_id)
+
+        if not person:
+            return jsonify({
+                'success': False,
+                'error': 'Person not found'
+            }), 404
+
+        # Update name
+        name = request.form.get('name', '').strip()
+
+        if not name:
+            return jsonify({
+                'success': False,
+                'error': 'Name cannot be empty'
+            }), 400
+
+        duplicate = Person.query.filter(
+            Person.name == name,
+            Person.id != person_id
+        ).first()
+
+        if duplicate:
+            return jsonify({
+                'success': False,
+                'error': 'Another person with this name already exists.'
+            }), 409
+
+        # Update age
+        age_text = request.form.get('age', '').strip()
+
+        if age_text:
+            if not age_text.isdigit() or int(age_text) <= 0:
+                return jsonify({
+                    'success': False,
+                    'error': 'Enter a valid age.'
+                }), 400
+            person.age = int(age_text)
+        else:
+            person.age = None
+
+        # Update gender
+        gender = request.form.get('gender', '').strip()
+        if gender not in ['', 'Male', 'Female', 'Other']:
+            return jsonify({
+                'success': False,
+                'error': 'Invalid gender.'
+            }), 400
+
+        person.gender = gender or None
+
+        # Update last seen information
+        person.last_seen_location = (
+            request.form.get('last_seen_location', '').strip() or None
+        )
+
+        date_text = request.form.get('last_seen_date', '').strip()
+
+        if date_text:
+            person.last_seen_date = datetime.fromisoformat(date_text)
+        else:
+            person.last_seen_date = None
+
+        # Update contact information
+        person.contact_info = (
+            request.form.get('contact_info', '').strip() or None
+        )
+        person.contact_phone = (
+            request.form.get('contact_phone', '').strip() or None
+        )
+        person.contact_email = (
+            request.form.get('contact_email', '').strip() or None
+        )
+
+        person.description = (
+            request.form.get('description', '').strip() or None
+        )
+
+        # Status is editable here, not during registration
+        status = request.form.get('case_status', 'active').strip().lower()
+
+        if status not in ['active', 'under_review', 'resolved']:
+            return jsonify({
+                'success': False,
+                'error': 'Invalid case status.'
+            }), 400
+
+        person.case_status = status
+
+        # Replace photograph only if a new one was uploaded
+        image_file = request.files.get('image')
+
+        if image_file and image_file.filename:
+            if not allowed_file(image_file.filename):
+                return jsonify({
+                    'success': False,
+                    'error': 'Invalid image file type.'
+                }), 400
+
+            filename = secure_filename(image_file.filename)
+            timestamp = datetime.now().strftime('%Y%m%d_%H%M%S_%f')
+            unique_filename = f'{timestamp}_{filename}'
+
+            filepath = os.path.join(
+                app.config['UPLOAD_FOLDER'],
+                unique_filename
+            )
+
+            image_file.save(filepath)
+
+            embedding = compute_face_embedding(filepath)
+
+            if embedding is None:
+                os.remove(filepath)
+                filepath = None
+
+                return jsonify({
+                    'success': False,
+                    'error': 'No face detected in the new photograph.'
+                }), 400
+
+            vector = np.asarray(embedding, dtype=np.float32)
+
+            if vector.shape != (512,) or not np.isfinite(vector).all():
+                raise ValueError('Invalid face embedding generated.')
+
+            norm = float(np.linalg.norm(vector))
+
+            if norm == 0:
+                raise ValueError('Invalid zero-length face embedding.')
+
+            vector = vector / norm
+
+            face_record = (
+                FaceEmbedding.query
+                .filter_by(person_id=person.id)
+                .order_by(FaceEmbedding.created_at.desc())
+                .first()
+            )
+
+            if face_record is None:
+                face_record = FaceEmbedding(
+                    person_id=person.id,
+                    embedding=vector.astype(float).tolist(),
+                    embedding_dimension=512,
+                    is_normalized=True,
+                    model_name='buffalo_l'
+                )
+                db.session.add(face_record)
+            else:
+                face_record.embedding = vector.astype(float).tolist()
+                face_record.embedding_dimension = 512
+                face_record.is_normalized = True
+                face_record.model_name = 'buffalo_l'
+
+            face_record.image_filename = unique_filename
+            person.image_filename = unique_filename
+
+        person.name = name
+
+        db.session.commit()
+
+        # Refresh detection cache, including renamed people or new photos
+        load_postgres_embeddings()
+        log_audit_event(
+            'PERSON_UPDATED',
+            f'Updated missing person: {person.name}',
+            details={'person_id': person.id, 'name': person.name, 'case_status': person.case_status}
+        )
+
+        return jsonify({
+            'success': True,
+            'message': 'Person record updated successfully.',
+            'person_id': person.id
+        }), 200
+
+    except Exception as e:
+        db.session.rollback()
+
+        if filepath and os.path.exists(filepath):
+            try:
+                os.remove(filepath)
+            except OSError:
+                pass
+
+        logging.exception('Person update failed')
+
+        return jsonify({
+            'success': False,
+            'error': str(e)
         }), 500
 
 
 @app.route('/target_person/<name>', methods=['DELETE'])
+@admin_required
 def delete_target_person(name):
-    """
-    DELETE endpoint to remove a missing person by name
-    Returns JSON response with success status
-    """
+    """Delete a person and related embeddings/match events from PostgreSQL."""
+    from urllib.parse import unquote
+
+    person_name = unquote(name)
+
     try:
-        from urllib.parse import unquote
-        person_name = unquote(name)
-        
-        embeddings_dict = load_embeddings()
-        
-        if person_name not in embeddings_dict:
+        person = Person.query.filter_by(name=person_name).first()
+        if person is None:
             return jsonify({
                 'success': False,
-                'error': f'Person "{person_name}" not found in database'
+                'error': f'Person "{person_name}" not found in PostgreSQL'
             }), 404
-        
-        # Delete the person
-        deleted_data = embeddings_dict.pop(person_name)
-        
-        # Save updated embeddings
-        if save_embeddings(embeddings_dict):
-            # Reload embeddings in real-time detector
-            try:
-                realtime_detector.reload_embeddings()
-            except Exception as e:
-                print(f"Warning: Could not reload embeddings after deletion: {e}")
-            
-            # Log audit event
-            log_audit_event(
-                'PERSON_DELETED',
-                f'Removed missing person: {person_name}',
-                details={'name': person_name, 'image_file': deleted_data.get('image_filename')}
-            )
-            
-            return jsonify({
-                'success': True,
-                'message': f'Successfully removed missing person: {person_name}',
-                'total_persons': len(embeddings_dict)
-            }), 200
-        else:
-            return jsonify({
-                'success': False,
-                'error': 'Failed to save embeddings after deletion'
-            }), 500
-            
+
+        deleted_data = {
+            'name': person.name,
+            'image_filename': person.image_filename,
+            'person_id': person.id
+        }
+
+        # MatchEvent has a non-null Person FK, so remove its rows first.
+        MatchEvent.query.filter_by(person_id=person.id).delete(synchronize_session=False)
+
+        # FaceEmbedding rows are removed by Person.embeddings delete-orphan cascade.
+        db.session.delete(person)
+        db.session.commit()
+
+        load_postgres_embeddings()
+
+        log_audit_event(
+            'PERSON_DELETED',
+            f'Removed missing person: {person_name}',
+            details=deleted_data
+        )
+
+        return jsonify({
+            'success': True,
+            'message': f'Successfully removed missing person: {person_name}',
+            'total_persons': Person.query.count()
+        }), 200
+
     except Exception as e:
-        error_msg = str(e)
-        try:
-            error_msg = error_msg.encode('ascii', 'replace').decode('ascii')
-        except:
-            error_msg = "An error occurred while deleting the person"
+        db.session.rollback()
+        logging.exception('PostgreSQL person deletion failed')
         return jsonify({
             'success': False,
-            'error': f'Server error: {error_msg}'
+            'error': f'Server error: {str(e)}'
         }), 500
 
 
 def find_matching_person(detected_embedding, threshold=0.6):
-    """
-    Find matching person from stored embeddings using cosine similarity
-    Returns list of matches with similarity scores
-    """
-    embeddings_dict = load_embeddings()
+    """Compare a supplied face embedding against embeddings loaded from PostgreSQL."""
     matches = []
-    
-    if not embeddings_dict:
+    if not getattr(realtime_detector, "stored_embeddings_np", None):
         return matches
-    
-    detected_embedding_np = np.array(detected_embedding).reshape(1, -1)
-    
-    for name, data in embeddings_dict.items():
-        stored_embedding = np.array(data.get('embedding')).reshape(1, -1)
-        
-        # Calculate cosine similarity
-        similarity = cosine_similarity(detected_embedding_np, stored_embedding)[0][0]
-        
+
+    detected = np.asarray(detected_embedding, dtype=np.float32).reshape(1, -1)
+    if detected.shape[1] != 512 or not np.isfinite(detected).all():
+        return matches
+
+    for name, stored_embedding in realtime_detector.stored_embeddings_np.items():
+        stored = np.asarray(stored_embedding, dtype=np.float32).reshape(1, -1)
+        if stored.shape != detected.shape or not np.isfinite(stored).all():
+            continue
+
+        similarity = float(cosine_similarity(detected, stored)[0][0])
         if similarity >= threshold:
+            metadata = realtime_detector.stored_embeddings.get(name, {})
+
             matches.append({
-                'name': name,
-                'similarity': float(similarity),
-                'confidence': f"{similarity * 100:.2f}%",
-                'created_at': data.get('created_at')
+                "name": name,
+                "similarity": similarity,
+                "confidence": f"{similarity * 100:.2f}%",
+                "created_at": metadata.get("created_at"),
+                "image_filename": metadata.get("image_filename"),
+                "person_id": metadata.get("person_id")
             })
-    
-    # Sort by similarity (highest first)
-    matches.sort(key=lambda x: x['similarity'], reverse=True)
+
+    matches.sort(key=lambda item: item["similarity"], reverse=True)
     return matches
 
 
+
+
 @app.route('/detect', methods=['POST'])
+@admin_required
 def detect_person():
     """
     Process an uploaded image using the separate image detection pipeline.
@@ -804,6 +1615,7 @@ def detect_all_faces(image):
 
 
 @app.route('/detect_faces', methods=['POST'])
+@admin_required
 def detect_faces_for_selection():
 
     if 'image' not in request.files:
@@ -863,6 +1675,7 @@ def detect_faces_for_selection():
 
 
 @app.route('/match_selected_face', methods=['POST'])
+@admin_required
 def match_selected_face():
 
     if 'image' not in request.files:
@@ -928,6 +1741,14 @@ def match_selected_face():
         matches = realtime_detector.match_person(
             np.asarray(embedding, dtype=np.float32)
         )
+        # Add registered photo metadata to each match
+        for match in matches:
+            metadata = realtime_detector.stored_embeddings.get(
+                match.get("name"), {}
+            )
+
+            match["image_filename"] = metadata.get("image_filename")
+            match["person_id"] = metadata.get("person_id")
 
         best_match = matches[0] if matches else None
 
@@ -965,17 +1786,36 @@ def health_check():
 
 @app.route('/', methods=['GET'])
 def index():
-    """Serve the HTML frontend"""
+    """Public FindTrace reporting and case-tracking portal."""
+    return render_template('public_portal.html')
+
+
+@app.route('/app', methods=['GET'])
+@admin_page_required
+def legacy_application_page():
+    """Existing operator-facing identification interface."""
     return render_template('index.html')
 
 
+@app.route('/report', methods=['GET'])
+def public_report_page():
+    return render_template('report.html')
+
+
+@app.route('/track', methods=['GET'])
+def public_track_page():
+    return render_template('track.html')
+
+
 @app.route('/camera', methods=['GET'])
+@admin_page_required
 def camera_page():
     """Serve the camera detection page"""
     return render_template('camera.html')
 
 
 @app.route('/realtime', methods=['GET'])
+@admin_page_required
 def realtime_page():
     """Serve the real-time detection dashboard"""
     return render_template('realtime.html')
@@ -984,13 +1824,318 @@ def realtime_page():
 @app.route('/admin', methods=['GET'])
 def admin_page():
     """Serve the admin panel dashboard"""
-    return render_template('admin.html')
+    return render_template('admin_dashboard.html')
 
 
 @app.route('/instructions', methods=['GET'])
 def instructions_page():
     """Serve the instructions page"""
     return render_template('instructions.html')
+
+
+
+# ================= PUBLIC CASE SUBMISSION API =================
+
+@app.route("/api/cases/submit", methods=["POST"])
+def submit_public_case():
+    """Accept a public report; pending submissions do not create recognition embeddings."""
+    saved_path = None
+    try:
+        required_text = [
+            "person_name", "last_seen_location", "reporter_name", "reporter_phone"
+        ]
+        values = {key: request.form.get(key, "").strip() for key in required_text}
+        missing = [key for key, value in values.items() if not value]
+        if missing:
+            return jsonify({
+                "success": False,
+                "error": "Required fields missing: " + ", ".join(missing)
+            }), 400
+
+        image_file = request.files.get("image")
+        if not image_file or not image_file.filename:
+            return jsonify({"success": False, "error": "A recent photograph is required."}), 400
+        if not allowed_file(image_file.filename):
+            return jsonify({"success": False, "error": "Unsupported image format."}), 400
+
+        age_text = request.form.get("age", "").strip()
+        if age_text and (not age_text.isdigit() or int(age_text) <= 0 or int(age_text) > 130):
+            return jsonify({"success": False, "error": "Enter a valid age."}), 400
+
+        date_text = request.form.get("last_seen_date", "").strip()
+        last_seen_date = datetime.fromisoformat(date_text) if date_text else None
+
+        filename = f"pending_{secrets.token_hex(12)}_{secure_filename(image_file.filename)}"
+        saved_path = os.path.join(app.config["UPLOAD_FOLDER"], filename)
+        image_file.save(saved_path)
+
+        # Validate that the upload is a readable image, without generating an embedding.
+        if cv2.imread(saved_path) is None:
+            os.remove(saved_path)
+            return jsonify({"success": False, "error": "Uploaded file is not a valid image."}), 400
+
+        case = CaseSubmission(
+            case_id=create_case_id(),
+            person_name=values["person_name"][:150],
+            age=int(age_text) if age_text else None,
+            gender=request.form.get("gender", "").strip() or None,
+            last_seen_location=values["last_seen_location"][:255],
+            last_seen_date=last_seen_date,
+            description=request.form.get("description", "").strip() or None,
+            image_filename=filename,
+            reporter_name=values["reporter_name"][:150],
+            reporter_phone=values["reporter_phone"][:30],
+            reporter_email=request.form.get("reporter_email", "").strip() or None,
+            status="pending",
+        )
+        db.session.add(case)
+        db.session.commit()
+
+        log_audit_event(
+            "CASE_SUBMITTED",
+            f"Public case submitted: {case.case_id}",
+            user="public",
+            details={"case_id": case.case_id, "status": "pending"}
+        )
+        return jsonify({
+            "success": True,
+            "case_id": case.case_id,
+            "status": "pending",
+            "message": "Your report has been submitted for admin review."
+        }), 201
+
+    except ValueError:
+        db.session.rollback()
+        if saved_path and os.path.exists(saved_path):
+            os.remove(saved_path)
+        return jsonify({"success": False, "error": "Invalid last-seen date."}), 400
+    except Exception as exc:
+        db.session.rollback()
+        if saved_path and os.path.exists(saved_path):
+            try:
+                os.remove(saved_path)
+            except OSError:
+                pass
+        logging.exception("Public case submission failed")
+        return jsonify({"success": False, "error": "Could not submit the case."}), 500
+
+
+@app.route("/api/cases/track/<case_id>", methods=["GET"])
+def track_public_case(case_id):
+    """Return safe, non-private status details for a public case ID."""
+    case = CaseSubmission.query.filter_by(case_id=case_id.strip().upper()).first()
+    if not case:
+        return jsonify({"success": False, "error": "Case ID not found."}), 404
+    return jsonify({
+        "success": True,
+        "case": {
+            "case_id": case.case_id,
+            "person_name": case.person_name,
+            "status": case.status,
+            "submitted_at": case.submitted_at.isoformat() if case.submitted_at else None,
+            "reviewed_at": case.reviewed_at.isoformat() if case.reviewed_at else None,
+            "review_note": case.review_note,
+        }
+    }), 200
+
+
+# ================= ADMIN AUTHENTICATION =================
+
+@app.route("/api/admin/setup", methods=["POST"])
+def setup_first_admin():
+    """One-time bootstrap; requires credentials configured in environment variables."""
+    try:
+        if Admin.query.count() > 0:
+            return jsonify({"success": False, "error": "Admin setup is already completed."}), 409
+
+        expected_key = os.getenv("ADMIN_SETUP_KEY")
+        supplied_key = request.headers.get("X-Admin-Setup-Key", "")
+        username = os.getenv("INITIAL_ADMIN_USERNAME", "").strip()
+        password = os.getenv("INITIAL_ADMIN_PASSWORD", "")
+
+        if not expected_key or not secrets.compare_digest(supplied_key, expected_key):
+            return jsonify({"success": False, "error": "Valid setup key required."}), 403
+        if not username or len(password) < 12:
+            return jsonify({
+                "success": False,
+                "error": "Set INITIAL_ADMIN_USERNAME and an INITIAL_ADMIN_PASSWORD of at least 12 characters."
+            }), 400
+
+        admin = Admin(username=username, password_hash=generate_password_hash(password))
+        db.session.add(admin)
+        db.session.commit()
+        log_audit_event("ADMIN_CREATED", f"Initial admin created: {username}", user=username)
+        return jsonify({"success": True, "message": "Initial admin account created."}), 201
+    except Exception:
+        db.session.rollback()
+        logging.exception("Initial admin setup failed")
+        return jsonify({"success": False, "error": "Admin setup failed."}), 500
+
+
+@app.route("/api/admin/login", methods=["POST"])
+def admin_login():
+    data = request.get_json(silent=True) or request.form
+    username = str(data.get("username", "")).strip()
+    password = str(data.get("password", ""))
+    admin = Admin.query.filter_by(username=username).first()
+    if not admin or not check_password_hash(admin.password_hash, password):
+        return jsonify({"success": False, "error": "Invalid username or password."}), 401
+    session.clear()
+    session["admin_id"] = admin.id
+    session["admin_username"] = admin.username
+    log_audit_event("ADMIN_LOGIN", f"Admin logged in: {admin.username}", user=admin.username)
+    return jsonify({"success": True, "username": admin.username}), 200
+
+
+@app.route("/api/admin/logout", methods=["POST"])
+@admin_required
+def admin_logout():
+    username = session.get("admin_username", "admin")
+    session.clear()
+    log_audit_event("ADMIN_LOGOUT", f"Admin logged out: {username}", user=username)
+    return jsonify({"success": True, "message": "Logged out."}), 200
+
+
+@app.route("/api/admin/session", methods=["GET"])
+@admin_required
+def admin_session():
+    return jsonify({"success": True, "username": session.get("admin_username")}), 200
+
+
+# ================= ADMIN CASE REVIEW =================
+
+@app.route("/api/admin/cases", methods=["GET"])
+@admin_required
+def admin_list_cases():
+    status = request.args.get("status", "").strip().lower()
+    query = CaseSubmission.query
+    if status in {"pending", "approved", "rejected"}:
+        query = query.filter_by(status=status)
+    cases = query.order_by(CaseSubmission.submitted_at.desc()).all()
+    return jsonify({
+        "success": True,
+        "count": len(cases),
+        "cases": [case_submission_payload(case, include_private=True) for case in cases]
+    }), 200
+
+
+@app.route("/api/admin/cases/<case_id>/review", methods=["POST"])
+@admin_required
+def review_case(case_id):
+    """Approve or reject a submission; approval is the only path that creates an embedding."""
+    data = request.get_json(silent=True) or {}
+    decision = str(data.get("decision", "")).strip().lower()
+    review_note = str(data.get("review_note", "")).strip() or None
+    if decision not in {"approve", "reject"}:
+        return jsonify({"success": False, "error": "Decision must be approve or reject."}), 400
+
+    case = CaseSubmission.query.filter_by(case_id=case_id.strip().upper()).with_for_update().first()
+    if not case:
+        return jsonify({"success": False, "error": "Case not found."}), 404
+    if case.status != "pending":
+        return jsonify({"success": False, "error": f"Case is already {case.status}."}), 409
+
+    admin_name = session.get("admin_username", "admin")
+    created_person = None
+    try:
+        if decision == "reject":
+            case.status = "rejected"
+            case.review_note = review_note
+            case.reviewed_by = admin_name
+            case.reviewed_at = datetime.utcnow()
+            db.session.commit()
+            log_audit_event("CASE_REJECTED", f"Case rejected: {case.case_id}", user=admin_name)
+            return jsonify({"success": True, "status": "rejected", "case_id": case.case_id}), 200
+
+        # Do not create a duplicate active Person record for an identical name.
+        existing = Person.query.filter_by(name=case.person_name).first()
+        if existing:
+            return jsonify({
+                "success": False,
+                "error": "A person with this name is already registered. Review the existing record before approving."
+            }), 409
+
+        image_path = os.path.join(app.config["UPLOAD_FOLDER"], case.image_filename)
+        embedding = compute_face_embedding(image_path)
+        if embedding is None:
+            return jsonify({
+                "success": False,
+                "error": "No face could be extracted from the submitted photo. Ask the reporter for a clearer image."
+            }), 400
+
+        vector = np.asarray(embedding, dtype=np.float32)
+        if vector.shape != (512,) or not np.isfinite(vector).all():
+            raise ValueError("Generated embedding is not a valid 512-dimensional vector.")
+        norm = float(np.linalg.norm(vector))
+        if norm == 0:
+            raise ValueError("Generated embedding has zero length.")
+        vector = vector / norm
+
+        created_person = Person(
+            name=case.person_name,
+            age=case.age,
+            gender=case.gender,
+            last_seen_location=case.last_seen_location,
+            last_seen_date=case.last_seen_date,
+            description=case.description,
+            image_filename=case.image_filename,
+            uploader_ip=request.remote_addr,
+            source="approved_public_case",
+            case_status="active",
+        )
+        db.session.add(created_person)
+        db.session.flush()
+
+        db.session.add(FaceEmbedding(
+            person_id=created_person.id,
+            embedding=vector.astype(float).tolist(),
+            embedding_dimension=512,
+            is_normalized=True,
+            model_name="buffalo_l",
+            image_filename=case.image_filename,
+        ))
+        case.status = "approved"
+        case.review_note = review_note
+        case.reviewed_by = admin_name
+        case.reviewed_at = datetime.utcnow()
+        case.person_id = created_person.id
+        db.session.commit()
+
+        # Only after successful DB commit is the new approved person loaded into CCTV matching.
+        load_postgres_embeddings()
+        log_audit_event(
+            "CASE_APPROVED",
+            f"Case approved and activated: {case.case_id}",
+            user=admin_name,
+            details={"case_id": case.case_id, "person_id": created_person.id}
+        )
+        return jsonify({
+            "success": True,
+            "status": "approved",
+            "case_id": case.case_id,
+            "person_id": created_person.id,
+            "message": "Case approved and person added to recognition."
+        }), 200
+
+    except Exception:
+        db.session.rollback()
+        logging.exception("Case review failed for %s", case_id)
+        return jsonify({"success": False, "error": "Could not complete case review."}), 500
+
+
+@app.route("/api/admin/dashboard-summary", methods=["GET"])
+@admin_required
+def admin_dashboard_summary():
+    return jsonify({
+        "success": True,
+        "pending_cases": CaseSubmission.query.filter_by(status="pending").count(),
+        "approved_cases": CaseSubmission.query.filter_by(status="approved").count(),
+        "rejected_cases": CaseSubmission.query.filter_by(status="rejected").count(),
+        "registered_persons": Person.query.count(),
+        "match_events": MatchEvent.query.count(),
+        "cameras": Camera.query.count(),
+    }), 200
+
 
 
 def load_configured_cameras():
@@ -1018,6 +2163,7 @@ def save_configured_cameras(cameras_list):
 
 
 @app.route('/api/stream/start', methods=['POST'])
+@admin_required
 def start_stream():
     """Start real-time video stream processing with enhanced detection"""
     global processing_thread, stream_processor
@@ -1028,7 +2174,16 @@ def start_stream():
     if isinstance(source, str) and source.isdigit():
         source = int(source)
     camera_name = data.get('camera_name', str(source))  # Human-readable camera name    
+    camera_location = data.get('location')
+    camera_type = data.get('type')
+    camera_record_id = None
     try:
+        camera_record = get_or_create_camera_record(
+            camera_name, source, camera_type=camera_type, location=camera_location
+        )
+        db.session.commit()
+        camera_record_id = camera_record.id
+
         # Set detection backend for robustness (e.g. RetinaFace for CCTV/drone)
        
         
@@ -1043,8 +2198,8 @@ def start_stream():
                 processing_thread.join(timeout=3)
                 time.sleep(0.5)  # Extra time for OS to release camera resource
         
-        # Reload embeddings in case new persons were added
-        realtime_detector.reload_embeddings()
+        # Reload the current PostgreSQL embeddings before starting the stream.
+        load_postgres_embeddings()
         
         # Open camera source with name
         if stream_processor.open_camera(source, camera_name=camera_name):
@@ -1063,7 +2218,7 @@ def start_stream():
                             # Only process alerts for strong matches (reduce spam)
                             if sim >= alert_system.alert_threshold:
                                 # Alert system has its own cooldown - will skip repeated alerts
-                                alert_system.send_alert(
+                                alert_record = alert_system.send_alert(
                                     match,
                                     frame=annotated_frame,
                                     frame_info={
@@ -1074,6 +2229,8 @@ def start_stream():
                                     },
                                     camera_source=camera_name
                                 )
+                                if alert_record:
+                                    match['_snapshot_path'] = alert_record.get('snapshot_path')
 
                     # ---------- SEND MATCH DATA (deduplicated/throttled) ----------
                     if matches:
@@ -1092,8 +2249,23 @@ def start_stream():
                             if now_ts - last_emitted >= match_emit_cooldown:
                                 deduped_matches.append(match)
                                 match_last_emitted[key] = now_ts
+                                save_match_event(
+                                    match,
+                                    camera_source=camera_name,
+                                    camera_id=camera_record_id,
+                                    snapshot_path=match.get('_snapshot_path')
+                                )
 
                         if deduped_matches:
+                            log_audit_event(
+                                'MATCH_DETECTED',
+                                f"{len(deduped_matches)} potential match(es) detected by {camera_name}",
+                                details={
+                                    'camera_id': camera_record_id,
+                                    'camera_source': camera_name,
+                                    'person_names': [m.get('name') for m in deduped_matches]
+                                }
+                            )
                             socketio.emit('match_found', {
                                 'matches': deduped_matches,
                                 'timestamp': datetime.now().isoformat(),
@@ -1118,8 +2290,15 @@ def start_stream():
                 stream_processor.process_stream(callback)
 
             
+            set_camera_status(source, "active", is_active=True)
             processing_thread = threading.Thread(target=process_with_callback, daemon=True)
             processing_thread.start()
+
+            log_audit_event(
+                'CAMERA_STREAM_STARTED',
+                f"Camera stream started: {camera_name}",
+                details={'camera_id': camera_record_id, 'source': str(source)}
+            )
             
             return jsonify({
                 'success': True,
@@ -1128,6 +2307,7 @@ def start_stream():
                 'stored_persons': len(realtime_detector.stored_embeddings)
             }), 200
         else:
+            set_camera_status(source, "configured", is_active=True)
             return jsonify({
                 'success': False,
                 'error': 'Failed to open camera source'
@@ -1143,12 +2323,24 @@ def start_stream():
 
 
 @app.route('/api/stream/stop', methods=['POST'])
+@admin_required
 def stop_stream():
     global stream_processor
 
     try:
+        current_source = getattr(stream_processor, 'current_source', None) if stream_processor else None
+        current_camera_name = getattr(stream_processor, 'camera_name', None) if stream_processor else None
+
         if stream_processor:
             stream_processor.stop()
+
+        if current_source is not None:
+            set_camera_status(current_source, "configured", is_active=True)
+            log_audit_event(
+                'CAMERA_STREAM_STOPPED',
+                f"Camera stream stopped: {current_camera_name or current_source}",
+                details={'source': str(current_source)}
+            )
 
         socketio.emit('stream_stopped', {'success': True})
         return jsonify({'success': True})
@@ -1166,6 +2358,7 @@ def stop_stream():
 
 
 @app.route('/api/stream/status', methods=['GET'])
+@admin_required
 def stream_status():
     """Get current stream status"""
     return jsonify({
@@ -1182,13 +2375,14 @@ def stream_status():
 
 
 @app.route('/api/stream/reload', methods=['POST'])
+@admin_required
 def reload_embeddings():
     """Reload stored embeddings"""
     try:
-        realtime_detector.reload_embeddings()
+        loaded_count = load_postgres_embeddings()
         return jsonify({
             'success': True,
-            'message': f'Reloaded {len(realtime_detector.stored_embeddings)} embeddings'
+            'message': f'Reloaded {loaded_count} embeddings'
         }), 200
     except Exception as e:
         error_msg = str(e).encode('ascii', 'replace').decode('ascii')
@@ -1199,6 +2393,7 @@ def reload_embeddings():
 
 
 @app.route('/api/alerts/history', methods=['GET'])
+@admin_required
 def get_alert_history():
     """Get alert history"""
     try:
@@ -1221,6 +2416,7 @@ def get_alert_history():
 
 
 @app.route('/api/snapshots/<filename>', methods=['GET'])
+@admin_required
 def get_snapshot(filename):
     """Get snapshot image"""
     try:
@@ -1245,107 +2441,109 @@ def get_snapshot(filename):
 
 
 @app.route('/api/cameras', methods=['GET'])
+@admin_required
 def list_cameras():
-    """List available camera sources: webcams + configured CCTV/Drone from cameras.json"""
+    """List available webcams and configured cameras stored in PostgreSQL."""
     try:
         available_cameras = []
-        
-        # 1. Test webcam indices 0-3
         for i in range(4):
             test_cap = None
             try:
-                if sys.platform == 'win32':
-                    test_cap = cv2.VideoCapture(i, cv2.CAP_DSHOW)
-                else:
-                    test_cap = cv2.VideoCapture(i)
-                
+                test_cap = cv2.VideoCapture(i, cv2.CAP_DSHOW) if sys.platform == 'win32' else cv2.VideoCapture(i)
                 if test_cap.isOpened():
                     ret, frame = test_cap.read()
                     if ret:
                         available_cameras.append({
-                            'id': f'webcam_{i}',
-                            'name': f'Webcam {i}',
-                            'source': i,
-                            'type': 'webcam',
-                            'status': 'available'
+                            'id': f'webcam_{i}', 'name': f'Webcam {i}',
+                            'source': i, 'type': 'webcam', 'status': 'available'
                         })
-                test_cap.release()
             except Exception:
+                pass
+            finally:
                 if test_cap:
                     test_cap.release()
-                continue
-        
+
         if not any(c.get('type') == 'webcam' for c in available_cameras):
             available_cameras.insert(0, {
-                'id': 'webcam_0',
-                'name': 'Default Webcam (try this)',
-                'source': 0,
-                'type': 'webcam',
+                'id': 'webcam_0', 'name': 'Default Webcam (try this)',
+                'source': 0, 'type': 'webcam',
                 'status': 'unknown - may need testing'
             })
-        
-        # 2. Add configured CCTV and Drone streams from cameras.json
-        configured = load_configured_cameras()
-        for cam in configured:
-            cid = cam.get('id') or f"{cam.get('type', 'stream')}_{len(available_cameras)}"
+
+        # One-way compatibility import: bring any older cameras.json entries
+        # into PostgreSQL without creating duplicates (source is unique).
+        legacy_cameras = load_configured_cameras()
+        imported_legacy = False
+        for legacy in legacy_cameras:
+            legacy_source = legacy.get('source') or legacy.get('url')
+            if legacy_source is not None and str(legacy_source) != '':
+                get_or_create_camera_record(
+                    legacy.get('name') or legacy.get('camera_name') or str(legacy_source),
+                    legacy_source,
+                    camera_type=legacy.get('type') or 'cctv'
+                )
+                imported_legacy = True
+        if imported_legacy:
+            db.session.commit()
+
+        for cam in Camera.query.order_by(Camera.created_at.desc()).all():
             available_cameras.append({
-                'id': cid,
-                'name': cam.get('name', cid),
-                'source': cam.get('source') or cam.get('url', ''),
-                'type': cam.get('type', 'cctv'),  # 'cctv' or 'drone'
-                'status': cam.get('status', 'configured')
+                'id': cam.id, 'name': cam.camera_name, 'source': cam.source,
+                'type': cam.camera_type, 'status': cam.status
             })
-        
+
         return jsonify({
-            'success': True,
-            'cameras': available_cameras,
+            'success': True, 'cameras': available_cameras,
             'count': len(available_cameras),
             'message': f'Found {len(available_cameras)} camera(s)'
         }), 200
     except Exception as e:
-        error_msg = str(e).encode('ascii', 'replace').decode('ascii')
-        return jsonify({
-            'success': False,
-            'error': f'Error listing cameras: {error_msg}'
-        }), 500
+        db.session.rollback()
+        logging.exception("Error listing cameras from PostgreSQL")
+        return jsonify({'success': False, 'error': str(e)}), 500
 
 
 @app.route('/api/cameras/save', methods=['POST'])
+@admin_required
 def save_camera():
-    """Add a CCTV or Drone stream to cameras.json and return updated list."""
+    """Save a CCTV/IP/drone camera directly to PostgreSQL."""
     try:
-        data = request.json or {}
-        name = data.get('name', '').strip()
+        data = request.get_json(silent=True) or {}
+        name = (data.get('name') or data.get('camera_name') or '').strip()
         source = data.get('source') or data.get('url', '')
         stream_type = (data.get('type') or 'cctv').lower()
-        if stream_type not in ('cctv', 'drone'):
-            stream_type = 'cctv'
-        if not name or not source:
-            return jsonify({
-                'success': False,
-                'error': 'name and source (or url) are required'
-            }), 400
-        cameras = load_configured_cameras()
-        cam_id = f"{stream_type}_{name.replace(' ', '_')}_{len(cameras)}"
-        cameras.append({
-            'id': cam_id,
-            'name': name,
-            'source': source,
-            'type': stream_type,
-            'status': 'configured'
-        })
-        if save_configured_cameras(cameras):
-            return jsonify({
-                'success': True,
-                'message': f'Added {stream_type}: {name}',
-                'cameras': cameras
-            }), 200
-        return jsonify({'success': False, 'error': 'Failed to save cameras config'}), 500
+        location = (data.get('location') or '').strip() or None
+
+        if not name or source == '':
+            return jsonify({'success': False, 'error': 'name and source (or url) are required'}), 400
+
+        camera = get_or_create_camera_record(name, source, camera_type=stream_type, location=location)
+        db.session.commit()
+        log_audit_event(
+            'CAMERA_ADDED', f'Added camera: {camera.camera_name}',
+            details={'camera_id': camera.id, 'camera_type': camera.camera_type, 'location': camera.location}
+        )
+
+        return jsonify({
+            'success': True,
+            'message': f'Added {camera.camera_type}: {camera.camera_name} to PostgreSQL',
+            'camera': {
+                'id': camera.id, 'name': camera.camera_name, 'source': camera.source,
+                'type': camera.camera_type, 'status': camera.status
+            },
+            'cameras': [{
+                'id': c.id, 'name': c.camera_name, 'source': c.source,
+                'type': c.camera_type, 'status': c.status
+            } for c in Camera.query.order_by(Camera.created_at.desc()).all()]
+        }), 200
     except Exception as e:
-        error_msg = str(e).encode('ascii', 'replace').decode('ascii')
-        return jsonify({'success': False, 'error': error_msg}), 500
+        db.session.rollback()
+        logging.exception("Failed to save camera in PostgreSQL")
+        return jsonify({'success': False, 'error': str(e)}), 500
+
 
 @app.route('/api/cameras/test', methods=['POST'])
+@admin_required
 def test_camera():
     """Test if a camera source can be opened"""
     try:
@@ -1398,6 +2596,7 @@ def test_camera():
 
 
 @app.route('/api/evidence', methods=['GET'])
+@admin_required
 def get_evidence():
     """Get evidence collection (snapshots and alerts)"""
     try:
@@ -1439,61 +2638,96 @@ def get_evidence():
 
 
 def log_audit_event(event_type, description, user=None, details=None):
-    """Log audit events for law enforcement compliance"""
+    """Persist application audit events in PostgreSQL."""
     try:
-        timestamp = datetime.now().isoformat()
-        log_entry = {
-            'timestamp': timestamp,
-            'event_type': event_type,
-            'description': description,
-            'user': user or 'system',
-            'details': details or {}
-        }
-        
-        # Write to audit log file
-        with open(AUDIT_LOG_FILE, 'a', encoding='utf-8') as f:
-            f.write(json.dumps(log_entry, ensure_ascii=False) + '\n')
-        
-        logging.info(f"AUDIT: {event_type} - {description}")
-    except Exception as e:
-        logging.error(f"Error logging audit event: {e}")
+        with app.app_context():
+            entry = AuditLog(
+                event_type=str(event_type)[:100],
+                description=str(description),
+                user=str(user or "system")[:150],
+                ip_address=None,
+                action_status="success",
+                details=details or {},
+                timestamp=datetime.utcnow()
+            )
+            db.session.add(entry)
+            db.session.commit()
+        logging.info("AUDIT: %s - %s", event_type, description)
+        return True
+    except Exception:
+        try:
+            with app.app_context():
+                db.session.rollback()
+        except Exception:
+            pass
+        logging.exception("Error saving audit event to PostgreSQL")
+        return False
 
 
 @app.route('/api/audit', methods=['GET'])
+@admin_required
 def get_audit_log():
-    """Get audit log for compliance"""
+    """Retrieve audit events from PostgreSQL."""
     try:
-        limit = request.args.get('limit', 100, type=int)
-        event_type = request.args.get('event_type', None)
-        
-        audit_entries = []
-        if os.path.exists(AUDIT_LOG_FILE):
-            with open(AUDIT_LOG_FILE, 'r', encoding='utf-8') as f:
-                lines = f.readlines()
-                for line in lines[-limit:]:
-                    try:
-                        entry = json.loads(line.strip())
-                        if event_type is None or entry.get('event_type') == event_type:
-                            audit_entries.append(entry)
-                    except:
-                        continue
-        
-        return jsonify({
-            'success': True,
-            'count': len(audit_entries),
-            'audit_log': audit_entries
-        }), 200
+        limit = max(1, min(request.args.get('limit', 100, type=int), 1000))
+        event_type = request.args.get('event_type')
+        query = AuditLog.query
+        if event_type:
+            query = query.filter(AuditLog.event_type == event_type)
+        entries = query.order_by(AuditLog.timestamp.desc()).limit(limit).all()
+
+        audit_entries = [{
+            'id': entry.id,
+            'timestamp': entry.timestamp.isoformat() if entry.timestamp else None,
+            'event_type': entry.event_type,
+            'description': entry.description,
+            'user': entry.user,
+            'ip_address': entry.ip_address,
+            'action_status': entry.action_status,
+            'details': entry.details or {}
+        } for entry in entries]
+
+        return jsonify({'success': True, 'count': len(audit_entries), 'audit_log': audit_entries}), 200
     except Exception as e:
-        error_msg = str(e).encode('ascii', 'replace').decode('ascii')
-        return jsonify({
-            'success': False,
-            'error': f'Error retrieving audit log: {error_msg}'
-        }), 500
+        logging.exception("Error retrieving audit log from PostgreSQL")
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@app.route('/api/match-events', methods=['GET'])
+@admin_required
+def get_match_events():
+    """Retrieve persisted face-match events from PostgreSQL."""
+    try:
+        limit = max(1, min(request.args.get('limit', 100, type=int), 1000))
+        person_id = request.args.get('person_id', type=int)
+        query = MatchEvent.query
+        if person_id is not None:
+            query = query.filter(MatchEvent.person_id == person_id)
+        events = query.order_by(MatchEvent.detected_at.desc()).limit(limit).all()
+
+        results = []
+        for event in events:
+            person = db.session.get(Person, event.person_id)
+            results.append({
+                'id': event.id, 'person_id': event.person_id,
+                'person_name': person.name if person else None,
+                'camera_id': event.camera_id,
+                'camera_name': event.camera.camera_name if event.camera else None,
+                'similarity': event.similarity, 'camera_source': event.camera_source,
+                'snapshot_path': event.snapshot_path, 'review_status': event.review_status,
+                'detected_at': event.detected_at.isoformat() if event.detected_at else None
+            })
+        return jsonify({'success': True, 'count': len(results), 'match_events': results}), 200
+    except Exception as e:
+        logging.exception("Error retrieving match events from PostgreSQL")
+        return jsonify({'success': False, 'error': str(e)}), 500
 
 
 @socketio.on('connect')
 def handle_connect():
-    """Handle WebSocket connection"""
+    """Allow real-time monitoring sockets only for authenticated admins."""
+    if not session.get("admin_id"):
+        return False
     emit('connected', {'message': 'Connected to real-time detection server'})
 
 
@@ -1512,6 +2746,7 @@ if __name__ == '__main__':
 
 
 @app.route('/api/test/yolo', methods=['GET'])
+@admin_required
 def test_yolo():
     """Quick test to see if YOLO detects faces on default webcam"""
     try:
@@ -1534,6 +2769,7 @@ def test_yolo():
 
 
 @app.route('/api/test/embedding', methods=['GET'])
+@admin_required
 def test_embedding():
     """Test face embedding matching against stored persons"""
     try:
@@ -1556,13 +2792,12 @@ def test_embedding():
         if embedding is None:
             return jsonify({'success': False, 'error': 'ArcFace failed to generate embedding'}), 400
         
-        # Compare with stored embeddings
-        embeddings_dict = load_embeddings()
+        # Compare with embeddings loaded from PostgreSQL.
         results = {}
-        
-        for name, data in embeddings_dict.items():
-            stored_emb = np.array(data.get('embedding')).reshape(1, -1)
-            live_emb = embedding.reshape(1, -1)
+        live_emb = np.asarray(embedding, dtype=np.float32).reshape(1, -1)
+
+        for name, stored_emb in realtime_detector.stored_embeddings_np.items():
+            stored_emb = np.asarray(stored_emb, dtype=np.float32).reshape(1, -1)
             similarity = float(cosine_similarity(live_emb, stored_emb)[0][0])
             results[name] = {
                 'similarity': similarity,

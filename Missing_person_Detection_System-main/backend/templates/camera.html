@@ -312,6 +312,78 @@
             50% { transform: translateX(-50%) scale(1.05); }
             100% { transform: translateX(-50%) scale(1); }
         }
+    
+        .match-photo-container {
+            display: flex;
+            align-items: flex-start;
+            gap: 20px;
+            margin: 15px 0;
+            flex-wrap: wrap;
+        }
+
+        .match-photo-column {
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            width: 150px;
+        }
+
+        .match-photo {
+            width: 150px;
+            height: 170px;
+            object-fit: cover;
+            border-radius: 10px;
+            border: 2px solid #dee2e6;
+            background: #e9ecef;
+        }
+
+        .match-photo-label {
+            margin-top: 7px;
+            font-size: 0.85em;
+            color: #666;
+            text-align: center;
+        }
+        .match-photo-container {
+            display: flex;
+            gap: 20px;
+            margin: 15px 0;
+            flex-wrap: wrap;
+        }
+
+        .match-photo-column {
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            width: 150px;
+        }
+
+        .match-photo {
+            width: 150px;
+            height: 170px;
+            object-fit: cover;
+            border-radius: 10px;
+            border: 2px solid #dee2e6;
+        }
+
+        .match-photo-placeholder {
+            width: 150px;
+            height: 170px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            background: #e9ecef;
+            color: #666;
+            border-radius: 10px;
+            text-align: center;
+            padding: 10px;
+        }
+
+        .match-photo-label {
+            margin-top: 7px;
+            font-size: 0.85em;
+            color: #666;
+            text-align: center;
+        }
     </style>
 </head>
 
@@ -336,7 +408,7 @@
             <!-- Group Photo Upload Section -->
             <div class="section">
 
-                <h2>Upload Group Photo</h2>
+                <h2>Upload Photo</h2>
 
                 <div class="controls">
                     <input
@@ -962,32 +1034,25 @@
 
         function displayMatches(matches, facesDetected = 0) {
 
-            const container =
-                document.getElementById('resultsContainer');
+            const container = document.getElementById('resultsContainer');
 
-            if (matches.length === 0) {
+            if (!matches || matches.length === 0) {
 
-                if (facesDetected > 0) {
-
-                    container.innerHTML =
-                        `<div class="empty-state">
-                            Detected ${facesDetected} face(s) but no matches found in database
-                        </div>`;
-
-                } else {
-
-                    container.innerHTML =
-                        '<div class="empty-state">No faces detected in the image</div>';
-                }
+                container.innerHTML = `
+                    <div class="empty-state">
+                        ${facesDetected > 0
+                            ? `Detected ${facesDetected} face(s) but no matches found in database`
+                            : 'No faces detected in the image'}
+                    </div>
+                `;
 
                 return;
             }
 
-            // Group matches by person name.
+            // Group matches by person name
             const matchesByPerson = {};
 
             matches.forEach(match => {
-
                 if (!matchesByPerson[match.name]) {
                     matchesByPerson[match.name] = [];
                 }
@@ -996,77 +1061,118 @@
             });
 
             const uniquePersons = Object.keys(matchesByPerson);
-
             const personCount = uniquePersons.length;
 
-            let html =
-                `<div class="detection-summary">
+            let html = `
+                <div class="detection-summary">
                     Detected ${facesDetected} face(s), found ${personCount}
                     missing person${personCount > 1 ? 's' : ''}!
-                </div>`;
+                </div>
+            `;
 
             if (personCount > 1) {
 
-                html +=
-                    `<div class="multiple-persons-alert">
+                html += `
+                    <div class="multiple-persons-alert">
                         <h3>🚨 MULTIPLE MISSING PERSONS FOUND 🚨</h3>
                         <p><strong>${personCount} missing persons detected:</strong></p>
-                        <ul>`;
+                        <ul>
+                `;
 
                 uniquePersons.forEach(personName => {
 
-                    const personMatches =
-                        matchesByPerson[personName];
+                    const personMatches = matchesByPerson[personName];
 
                     const bestMatch = personMatches.reduce(
                         (best, current) =>
-                            current.similarity > best.similarity
-                                ? current
-                                : best
+                            current.similarity > best.similarity ? current : best
                     );
 
-                    html +=
-                        `<li>
+                    html += `
+                        <li>
                             <strong>${escapeHtml(personName)}</strong>
-                            - ${bestMatch.confidence} confidence
-                        </li>`;
+                            - ${escapeHtml(bestMatch.confidence)} confidence
+                        </li>
+                    `;
                 });
 
                 html += `</ul></div>`;
             }
 
-            // Show individual match details.
+            // Individual matched-person cards
             uniquePersons.forEach(personName => {
 
-                const personMatches =
-                    matchesByPerson[personName];
+                const personMatches = matchesByPerson[personName];
 
                 const bestMatch = personMatches.reduce(
                     (best, current) =>
-                        current.similarity > best.similarity
-                            ? current
-                            : best
+                        current.similarity > best.similarity ? current : best
                 );
+
+                const registeredPhotoUrl = bestMatch.image_filename
+                    ? `${API_BASE_URL}/uploads/${encodeURIComponent(bestMatch.image_filename)}`
+                    : null;
+
+                const photoHTML = registeredPhotoUrl
+                    ? `
+                        <div class="match-photo-column">
+                            <img
+                                class="match-photo"
+                                src="${registeredPhotoUrl}"
+                                alt="Registered photo of ${escapeHtml(personName)}"
+                                onerror="
+                                    this.style.display='none';
+                                    this.nextElementSibling.style.display='flex';
+                                "
+                            >
+
+                            <div class="match-photo-placeholder"
+                                style="display:none;">
+                                📷 Photo unavailable
+                            </div>
+
+                            <div class="match-photo-label">
+                                Registered Photo
+                            </div>
+                        </div>
+                    `
+                    : `
+                        <div class="match-photo-column">
+                            <div class="match-photo-placeholder">
+                                📷 No photo available
+                            </div>
+
+                            <div class="match-photo-label">
+                                Registered Photo
+                            </div>
+                        </div>
+                    `;
 
                 html += `
                     <div class="match-item">
 
                         <h3>${escapeHtml(personName)}</h3>
 
+                        <div class="match-photo-container">
+                            ${photoHTML}
+                        </div>
+
                         <div class="confidence">
-                            Best Confidence: ${bestMatch.confidence}
+                            Best Confidence: ${escapeHtml(bestMatch.confidence)}
                         </div>
 
                         <div class="details">
 
                             <strong>Similarity Score:</strong>
                             ${(bestMatch.similarity * 100).toFixed(2)}%
+
                             <br>
 
                             <strong>Face Index:</strong>
                             ${bestMatch.face_index !== undefined
                                 ? bestMatch.face_index
                                 : 'N/A'}
+
                             <br>
 
                             <strong>Added:</strong>
@@ -1075,6 +1181,7 @@
                                 : 'N/A'}
 
                         </div>
+
                     </div>
                 `;
             });

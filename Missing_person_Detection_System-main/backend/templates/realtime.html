@@ -5,6 +5,7 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Real-Time Detection - Missing Person Detection</title>
     <link rel="stylesheet" href="{{ url_for('static', filename='css/main.css') }}">
+    <link rel="stylesheet" href="{{ url_for('static', filename='css/realtime.css') }}">
     <script src="https://cdn.jsdelivr.net/npm/socket.io-client@4.5.4/dist/socket.io.min.js"></script>
 </head>
 <body>
@@ -33,7 +34,7 @@
         <main class="main-content">
             <div style="display: grid; grid-template-columns: 2fr 1.2fr; gap: 30px; align-items: start;">
                 <!-- Column 1: Video and Stats -->
-                <div style="position: sticky; top: 20px; z-index: 50;">
+                <div class="video-column">
                     <div class="video-wrapper" style="margin-bottom: 20px; box-shadow: 0 15px 35px rgba(0,0,0,0.6);">
                         <img id="videoStream" src="" alt="Video Stream" style="display: none;">
                         <div class="empty-state" id="videoPlaceholder">

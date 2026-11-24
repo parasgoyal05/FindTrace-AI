@@ -52,3 +52,5 @@ lfw_experiment_original/name_mapping.json
 # Camera configuration
 ../streams/cameras.json
 ../streams/
+
+.env

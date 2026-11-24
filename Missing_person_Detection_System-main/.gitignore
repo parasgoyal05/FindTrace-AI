@@ -27,3 +27,14 @@ streams/
 **/lfw_experiment_original/gallery/
 **/lfw_experiment_original/probe/
 **/lfw_experiment_original/name_mapping.json
+
+# Backup files
+**/backup/
+**/backups/
+
+# Private biometric data
+**/stored_embeddings.json
+
+# Python cache (including migration cache)
+**/__pycache__/
+*.py[cod]
